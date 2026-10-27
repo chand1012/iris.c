@@ -12,6 +12,7 @@ This downloads the VAE, transformer, and Qwen3 text encoder needed for inference
 """
 
 import argparse
+import importlib
 import sys
 from pathlib import Path
 
@@ -23,6 +24,8 @@ MODELS = {
     "zimage-turbo": ("Tongyi-MAI/Z-Image-Turbo", "./zimage-turbo"),
     "flux3": ("black-forest-labs/flux-3-image-klein", "./flux-3-klein"),
     "flux3-base": ("black-forest-labs/flux-3-image-klein-base", "./flux-3-klein-base"),
+    "qwen-image-2.1": ("Qwen/Qwen-Image-2.1", "./qwen-image-2.1"),
+    "qwen-image-2.1-turbo": ("Qwen/Qwen-Image-2.1-Turbo", "./qwen-image-2.1-turbo"),
 }
 
 USAGE_TEXT = """\
@@ -39,6 +42,8 @@ Available models:
   zimage-turbo  Z-Image-Turbo 6B (8 NFE / 9 scheduler steps, Apache 2.0, ~22 GB disk)
   flux3         FLUX.3 Image Klein 5.6B (16 steps, Kommunity license, ~21 GB disk)
   flux3-base    FLUX.3 Image Klein Base 5.6B (50 steps, CFG, Kommunity license, ~21 GB disk)
+  qwen-image-2.1      Qwen-Image 2.1 7B t2i+editing (Qwen3-VL-8B encoder, Apache 2.0, ~31 GB disk)
+  qwen-image-2.1-turbo Qwen-Image 2.1 Turbo 7B t2i+editing (~31 GB disk)
 
 By default this implementation uses mmap() so inference is often
 possible with less RAM than the model size.
@@ -73,7 +78,8 @@ def main():
     args = parser.parse_args()
 
     try:
-        from huggingface_hub import snapshot_download
+        # Dynamic import: huggingface_hub is an optional user-side dependency
+        snapshot_download = importlib.import_module("huggingface_hub").snapshot_download
     except ImportError:
         print("Error: huggingface_hub not installed")
         print("Install with: pip install huggingface_hub")
@@ -107,6 +113,8 @@ def main():
         "transformer/*.json",
         "text_encoder/*",
         "tokenizer/*",
+        "processor/*",   # Qwen-Image 2.1 keeps the Qwen3-VL tokenizer here
+        "scheduler/*",
     ]
 
     print("Downloading files...")

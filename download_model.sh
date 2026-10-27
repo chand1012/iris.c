@@ -15,6 +15,8 @@ show_usage() {
     echo "  zimage-turbo  Z-Image-Turbo 6B (8 NFE / 9 scheduler steps, Apache 2.0, ~22 GB disk)"
     echo "  flux3         FLUX.3 Image Klein 5.6B (16 steps, Kommunity license, ~21 GB disk)"
     echo "  flux3-base    FLUX.3 Image Klein Base 5.6B (50 steps, CFG, Kommunity license, ~21 GB disk)"
+    echo "  qwen-image-2.1      Qwen-Image 2.1 7B t2i+editing (Qwen3-VL-8B encoder, Apache 2.0, ~31 GB disk)"
+    echo "  qwen-image-2.1-turbo Qwen-Image 2.1 Turbo 7B t2i+editing (~31 GB disk)"
     echo ""
     echo "By default this implementation uses mmap() so inference is often"
     echo "possible with less RAM than the model size."
@@ -65,6 +67,13 @@ case "$MODEL" in
         REPO="flux-3-image-klein-base"
         OUT="./flux-3-klein-base"
         FLUX3=1
+        ;;
+    qwen-image-2.1|qwen-image-2.1-turbo)
+        ORG="Qwen"
+        REPO="Qwen-Image-2.1"
+        [ "$MODEL" = "qwen-image-2.1-turbo" ] && REPO="Qwen-Image-2.1-Turbo"
+        OUT="./${MODEL}"
+        QWEN21=1
         ;;
     *)
         echo "Unknown model: $MODEL"
@@ -140,6 +149,13 @@ if [ -n "$FLUX3" ]; then
     dl "$OUT/modular_model_index.json" "$BASE/modular_model_index.json"
     TOK_DIR="text_encoder"
     TOK_FILES="chat_template.json merges.txt tokenizer.json tokenizer_config.json vocab.json"
+elif [ -n "$QWEN21" ]; then
+    # Qwen-Image 2.1 keeps the Qwen3-VL tokenizer in processor/ and the scheduler separately
+    mkdir -p "$OUT"/{text_encoder,processor,transformer,vae,scheduler}
+    dl "$OUT/model_index.json" "$BASE/model_index.json"
+    dl "$OUT/scheduler/scheduler_config.json" "$BASE/scheduler/scheduler_config.json"
+    TOK_DIR="processor"
+    TOK_FILES="added_tokens.json chat_template.jinja merges.txt preprocessor_config.json special_tokens_map.json tokenizer.json tokenizer_config.json video_preprocessor_config.json vocab.json"
 else
     mkdir -p "$OUT"/{text_encoder,tokenizer,transformer,vae}
     # model_index.json (needed for autodetection)
