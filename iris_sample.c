@@ -234,6 +234,40 @@ float *iris_schedule_flux3(int num_steps) {
     return schedule;
 }
 
+/*
+ * Qwen-Image 2.1 schedule: the pipeline passes sigmas = linspace(1, 1/n, n)
+ * to the FlowMatch Euler scheduler, which applies a dynamic exponential time
+ * shift (mu = linear ramp of shift over the target token count), then
+ * stretches the schedule so its last value lands exactly at shift_terminal,
+ * and finally appends the terminal sigma 0.
+ */
+float *iris_schedule_qwen21(int num_steps, int image_seq_len,
+                            float base_shift, float max_shift,
+                            int base_len, int max_len, float shift_terminal) {
+    float *schedule = (float *)malloc((num_steps + 1) * sizeof(float));
+
+    float m = (max_shift - base_shift) / (max_len - base_len);
+    float b = base_shift - m * base_len;
+    float mu = image_seq_len * m + b;
+    float emu = expf(mu);
+
+    for (int i = 0; i < num_steps; i++) {
+        float u = (num_steps > 1) ? (float)i / (float)(num_steps - 1) : 0.0f;
+        float raw = 1.0f + (1.0f / num_steps - 1.0f) * u;
+        /* Exponential time shift with sigma=1: exp(mu) / (exp(mu) + 1/t - 1). */
+        schedule[i] = emu / (emu + (1.0f / raw - 1.0f));
+    }
+
+    /* Stretch so the final value equals shift_terminal. */
+    float scale = (1.0f - schedule[num_steps - 1]) / (1.0f - shift_terminal);
+    for (int i = 0; i < num_steps; i++) {
+        schedule[i] = 1.0f - (1.0f - schedule[i]) / scale;
+    }
+    schedule[num_steps] = 0.0f;
+
+    return schedule;
+}
+
 /* ========================================================================
  * Euler Sampler for Rectified Flow
  * ======================================================================== */

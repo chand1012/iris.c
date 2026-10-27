@@ -588,8 +588,8 @@ static void cmd_help(void) {
     printf("  !seed <n>             Set seed (-1 for random)\n");
     printf("  !size <W>x<H>         Set default size\n");
     printf("  !steps <n>            Set sampling steps (0 = auto)\n");
-    if (iris_is_zimage(state.ctx)) {
-        printf("  !guidance <n>         Set guidance (ignored for Z-Image, fixed at 0.0)\n");
+    if (iris_is_zimage(state.ctx) || iris_is_qwenimage21(state.ctx)) {
+        printf("  !guidance <n>         Set guidance (ignored, fixed at 0.0)\n");
     } else {
         printf("  !guidance <n>         Set CFG guidance scale (0 = auto)\n");
     }

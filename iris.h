@@ -2,7 +2,8 @@
  * Iris - C Image Generation Engine
  *
  * A dependency-free C inference engine for image synthesis models.
- * Supports FLUX.2 Klein and Z-Image-Turbo model families.
+ * Supports FLUX.2 Klein, FLUX.3 Image Klein, Z-Image-Turbo, and
+ * Qwen-Image 2.1 model families.
  *
  * Usage:
  *   iris_ctx *ctx = iris_load_dir("path/to/model");
@@ -80,6 +81,7 @@ enum {
     IRIS_SCHEDULE_POWER     = 2,
     IRIS_SCHEDULE_SIGMOID   = 3,  /* Flux shifted sigmoid */
     IRIS_SCHEDULE_FLOWMATCH = 4,  /* Z-Image FlowMatch Euler */
+    IRIS_SCHEDULE_QWEN21    = 5,  /* Qwen-Image 2.1 dynamic-shift FlowMatch */
 };
 
 typedef struct {
@@ -144,6 +146,11 @@ int iris_is_zimage(iris_ctx *ctx);
  * Check if model is FLUX.3 (Image Klein).
  */
 int iris_is_flux3(iris_ctx *ctx);
+
+/*
+ * Check if model is Qwen-Image 2.1 (single-stream DiT).
+ */
+int iris_is_qwenimage21(iris_ctx *ctx);
 
 /*
  * Default number of steps and guidance scale for the loaded model.

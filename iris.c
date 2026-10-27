@@ -114,10 +114,16 @@ extern float *iris_schedule_power(int num_steps, float alpha);
 extern float *iris_schedule_flux(int num_steps, int image_seq_len);
 extern float *iris_schedule_zimage(int num_steps, int image_seq_len);
 extern float *iris_schedule_flux3(int num_steps);
+extern float *iris_schedule_qwen21(int num_steps, int image_seq_len,
+                                   float base_shift, float max_shift,
+                                   int base_len, int max_len, float shift_terminal);
 extern float *iris_init_noise(int batch, int channels, int h, int w, int64_t seed);
 
 /* FLUX.3 transformer and sampling */
 typedef struct iris_transformer_flux3 iris_transformer_flux3_t;
+
+/* Qwen-Image 2.1 transformer (defined in iris_transformer_qwen21.c) */
+typedef struct qw_transformer qw_transformer_t;
 extern iris_transformer_flux3_t *iris_transformer_load_flux3(const char *model_dir);
 extern void iris_transformer_free_flux3(iris_transformer_flux3_t *tf);
 extern float *iris_sample_euler_flux3(void *transformer,
@@ -170,6 +176,21 @@ static float *iris_selected_flux3_schedule(const iris_params *p, int image_seq_l
     }
 }
 
+/* Return schedule for Qwen-Image 2.1 models based on params.
+ * Default is the dynamic-shift FlowMatch Euler from the scheduler config;
+ * overrides: linear, power. */
+static float *iris_selected_qwen21_schedule(const iris_params *p, int image_seq_len,
+                                            float base_shift, float max_shift,
+                                            int base_len, int max_len,
+                                            float shift_terminal) {
+    switch (p->schedule) {
+    case IRIS_SCHEDULE_LINEAR:    return iris_schedule_linear(p->num_steps);
+    case IRIS_SCHEDULE_POWER:     return iris_schedule_power(p->num_steps, p->power_alpha);
+    default:                      return iris_schedule_qwen21(p->num_steps, image_seq_len,
+                                    base_shift, max_shift, base_len, max_len, shift_terminal);
+    }
+}
+
 /* Return schedule for Z-Image models based on params.
  * Default is FlowMatch Euler; overrides: linear, power, sigmoid. */
 static float *iris_selected_zimage_schedule(const iris_params *p, int image_seq_len) {
@@ -199,6 +220,7 @@ struct iris_ctx {
     iris_transformer_flux_t *transformer;
     zi_transformer_t *zi_transformer;
     iris_transformer_flux3_t *flux3_transformer;
+    qw_transformer_t *qw_transformer;
 
     /* Configuration */
     int max_width;
@@ -211,6 +233,7 @@ struct iris_ctx {
     int num_heads;     /* Transformer attention heads (24 for 4B, 32 for 9B) */
     int is_zimage;     /* 1 = Z-Image S3-DiT, 0 = Flux MMDiT */
     int is_flux3;      /* 1 = FLUX.3 Image Klein */
+    int is_qwen21;     /* 1 = Qwen-Image 2.1 single-stream DiT */
 
     /* Z-Image specific config (from transformer/config.json) */
     int zi_dim;            /* Hidden dim (3840) */
@@ -222,6 +245,24 @@ struct iris_ctx {
     float zi_rope_theta;   /* RoPE theta (256.0) */
     int zi_axes_dims[3];   /* RoPE axis dims [32, 48, 48] */
     int zi_latent_channels;/* Patchified latent channels (64 = 16*2*2) */
+
+    /* Qwen-Image 2.1 config (from transformer/config.json) */
+    int qw_num_heads;   /* Attention heads (32) */
+    int qw_head_dim;    /* Head dim (128) */
+    int qw_n_layers;    /* Single-stream layers (32) */
+    int qw_in_channels; /* Latent channels (64) */
+    int qw_context_dim; /* Text encoder hidden dim (4096) */
+    int qw_mlp_ratio;   /* FFN expansion (3) */
+    int qw_axes_dims[3];/* RoPE axis dims [16, 56, 56] */
+    float qw_eps;       /* Norm eps (1e-6) */
+    int qw_causal_condition; /* Block-causal attention (1) */
+
+    /* Qwen-Image 2.1 scheduler (from scheduler/scheduler_config.json) */
+    float qw_shift_base;    /* Base shift (0.5) */
+    float qw_shift_max;     /* Max shift (0.9) */
+    int   qw_shift_base_len;/* Base image seq len (256) */
+    int   qw_shift_max_len; /* Max image seq len (8192) */
+    float qw_shift_terminal;/* Terminal sigma (0.02) */
 
     /* VAE config (read from vae/config.json) */
     int vae_z_channels;    /* Latent channels before patchify (32 Flux, 16 Z-Image) */
@@ -301,6 +342,10 @@ iris_ctx *iris_load_dir(const char *model_dir) {
             if (strstr(buf, "ZImagePipeline") || strstr(buf, "Z-Image")) {
                 ctx->is_zimage = 1;
             }
+            /* Qwen-Image 2.1 pipeline */
+            if (strstr(buf, "QwenImage21Pipeline")) {
+                ctx->is_qwen21 = 1;
+            }
             /* If "is_distilled" is present and true, it's distilled.
              * If absent, it's the base model. */
             if (!strstr(buf, "\"is_distilled\": true") &&
@@ -344,6 +389,12 @@ iris_ctx *iris_load_dir(const char *model_dir) {
                     p += 1 + strspn(p + 1, " ");
                     ctx->is_distilled = strncmp(p, "true", 4) == 0;
                 }
+            }
+
+            /* Qwen-Image 2.1 has no guidance input: always the no-CFG path. */
+            if (strstr(buf, "QwenImage21Transformer2DModel")) {
+                ctx->is_qwen21 = 1;
+                ctx->is_distilled = 1;
             }
 
             /* Parse Z-Image config if detected */
@@ -422,6 +473,66 @@ iris_ctx *iris_load_dir(const char *model_dir) {
                                           ctx->zi_patch_size * ctx->zi_patch_size;
                 ctx->text_dim = ctx->zi_cap_feat_dim;  /* 2560 for Z-Image */
             }
+
+            /* Parse Qwen-Image 2.1 config if detected */
+            if (ctx->is_qwen21) {
+                ctx->qw_num_heads = 32;
+                if ((p = strstr(buf, "\"num_attention_heads\""))) {
+                    char *colon = strchr(p, ':');
+                    if (colon) ctx->qw_num_heads = atoi(colon + 1);
+                }
+                ctx->qw_head_dim = 128;
+                if ((p = strstr(buf, "\"attention_head_dim\""))) {
+                    char *colon = strchr(p, ':');
+                    if (colon) ctx->qw_head_dim = atoi(colon + 1);
+                }
+                ctx->qw_n_layers = 32;
+                if ((p = strstr(buf, "\"num_layers\""))) {
+                    char *colon = strchr(p, ':');
+                    if (colon) ctx->qw_n_layers = atoi(colon + 1);
+                }
+                ctx->qw_in_channels = 64;
+                if ((p = strstr(buf, "\"in_channels\""))) {
+                    char *colon = strchr(p, ':');
+                    if (colon) ctx->qw_in_channels = atoi(colon + 1);
+                }
+                ctx->qw_context_dim = 4096;
+                if ((p = strstr(buf, "\"context_in_dim\""))) {
+                    char *colon = strchr(p, ':');
+                    if (colon) ctx->qw_context_dim = atoi(colon + 1);
+                }
+                ctx->qw_mlp_ratio = 3;
+                if ((p = strstr(buf, "\"mlp_ratio\""))) {
+                    char *colon = strchr(p, ':');
+                    if (colon) ctx->qw_mlp_ratio = atoi(colon + 1);
+                }
+                ctx->qw_eps = 1e-6f;
+                if ((p = strstr(buf, "\"eps\""))) {
+                    char *colon = strchr(p, ':');
+                    if (colon) ctx->qw_eps = (float)atof(colon + 1);
+                }
+                ctx->qw_causal_condition = 1;
+                if ((p = strstr(buf, "\"causal_condition\"")) && (p = strchr(p, ':'))) {
+                    p += 1 + strspn(p + 1, " ");
+                    ctx->qw_causal_condition = strncmp(p, "true", 4) == 0;
+                }
+                ctx->qw_axes_dims[0] = 16;
+                ctx->qw_axes_dims[1] = 56;
+                ctx->qw_axes_dims[2] = 56;
+                if ((p = strstr(buf, "\"axes_dims_rope\""))) {
+                    char *bracket = strchr(p, '[');
+                    if (bracket) {
+                        ctx->qw_axes_dims[0] = atoi(bracket + 1);
+                        char *comma1 = strchr(bracket, ',');
+                        if (comma1) {
+                            ctx->qw_axes_dims[1] = atoi(comma1 + 1);
+                            char *comma2 = strchr(comma1 + 1, ',');
+                            if (comma2) ctx->qw_axes_dims[2] = atoi(comma2 + 1);
+                        }
+                    }
+                }
+                ctx->text_dim = ctx->qw_context_dim;  /* 4096 */
+            }
         }
     }
 
@@ -456,6 +567,46 @@ iris_ctx *iris_load_dir(const char *model_dir) {
         }
     }
 
+    /* Read scheduler/scheduler_config.json for Qwen-Image 2.1 dynamic shift */
+    ctx->qw_shift_base = 0.5f;
+    ctx->qw_shift_max = 0.9f;
+    ctx->qw_shift_base_len = 256;
+    ctx->qw_shift_max_len = 8192;
+    ctx->qw_shift_terminal = 0.02f;
+    if (ctx->is_qwen21) {
+        snprintf(path, sizeof(path), "%s/scheduler/scheduler_config.json", model_dir);
+        if (file_exists(path)) {
+            FILE *f = fopen(path, "r");
+            if (f) {
+                char buf[4096];
+                size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+                buf[n] = '\0';
+                fclose(f);
+                char *p;
+                if ((p = strstr(buf, "\"base_shift\""))) {
+                    char *colon = strchr(p, ':');
+                    if (colon) ctx->qw_shift_base = (float)atof(colon + 1);
+                }
+                if ((p = strstr(buf, "\"max_shift\""))) {
+                    char *colon = strchr(p, ':');
+                    if (colon) ctx->qw_shift_max = (float)atof(colon + 1);
+                }
+                if ((p = strstr(buf, "\"base_image_seq_len\""))) {
+                    char *colon = strchr(p, ':');
+                    if (colon) ctx->qw_shift_base_len = atoi(colon + 1);
+                }
+                if ((p = strstr(buf, "\"max_image_seq_len\""))) {
+                    char *colon = strchr(p, ':');
+                    if (colon) ctx->qw_shift_max_len = atoi(colon + 1);
+                }
+                if ((p = strstr(buf, "\"shift_terminal\""))) {
+                    char *colon = strchr(p, ':');
+                    if (colon) ctx->qw_shift_terminal = (float)atof(colon + 1);
+                }
+            }
+        }
+    }
+
     /* Determine model variant name based on architecture. */
     if (ctx->is_zimage) {
         int hidden_size = ctx->zi_dim;
@@ -470,6 +621,13 @@ iris_ctx *iris_load_dir(const char *model_dir) {
         ctx->is_distilled = 1;        /* Treat as distilled (no CFG) */
         snprintf(ctx->model_name, sizeof(ctx->model_name),
                  "Z-Image-Turbo-%s", size_label);
+    } else if (ctx->is_qwen21) {
+        ctx->num_heads = num_heads;
+        ctx->is_non_commercial = 1;   /* Qwen Research License */
+        ctx->default_steps = 40;
+        ctx->default_guidance = 0.0f; /* No CFG input */
+        ctx->is_distilled = 1;
+        snprintf(ctx->model_name, sizeof(ctx->model_name), "Qwen-Image-2.1");
     } else if (ctx->is_flux3) {
         ctx->num_heads = num_heads;
         ctx->is_non_commercial = 1;   /* FLUX Kommunity License */
@@ -498,9 +656,11 @@ iris_ctx *iris_load_dir(const char *model_dir) {
 
     /* Load VAE only at startup (~300MB).
      * Transformer and text encoder are loaded on-demand during generation
-     * to support systems with limited RAM (e.g., 16GB). */
+     * to support systems with limited RAM (e.g., 16GB).
+     * Qwen-Image 2.1's VAE uses a different architecture (RMSNorm + residual
+     * blocks, 64-channel RGBA latents) and is loaded on demand instead. */
     snprintf(path, sizeof(path), "%s/vae/diffusion_pytorch_model.safetensors", model_dir);
-    if (file_exists(path)) {
+    if (!ctx->is_qwen21 && file_exists(path)) {
         safetensors_file_t *sf = safetensors_open(path);
         if (sf) {
             ctx->vae = iris_vae_load_safetensors_ex(sf,
@@ -509,8 +669,9 @@ iris_ctx *iris_load_dir(const char *model_dir) {
         }
     }
 
-    /* Verify VAE is loaded */
-    if (!ctx->vae) {
+    /* Verify VAE is loaded (Qwen-Image 2.1's VAE has a different architecture
+     * and is loaded on demand, so the directory can load without it for now). */
+    if (!ctx->vae && !ctx->is_qwen21) {
         set_error("Failed to load VAE - cannot generate images");
         iris_free(ctx);
         return NULL;
@@ -562,6 +723,10 @@ int iris_is_zimage(iris_ctx *ctx) {
 
 int iris_is_flux3(iris_ctx *ctx) {
     return ctx ? ctx->is_flux3 : 0;
+}
+
+int iris_is_qwenimage21(iris_ctx *ctx) {
+    return ctx ? ctx->is_qwen21 : 0;
 }
 
 int iris_default_steps(iris_ctx *ctx) {
@@ -662,6 +827,7 @@ void *iris_get_transformer(iris_ctx *ctx) {
     if (!ctx) return NULL;
     if (ctx->is_zimage) return ctx->zi_transformer;
     if (ctx->is_flux3) return ctx->flux3_transformer;
+    if (ctx->is_qwen21) return ctx->qw_transformer;
     return ctx->transformer;
 }
 
@@ -1145,7 +1311,11 @@ iris_image *iris_generate(iris_ctx *ctx, const char *prompt,
         return NULL;
     }
 
-    /* Route to Z-Image / FLUX.3 pipelines if appropriate */
+    /* Route to model-specific pipelines */
+    if (ctx->is_qwen21) {
+        set_error("Qwen-Image 2.1 generation is not implemented yet");
+        return NULL;
+    }
     if (ctx->is_zimage) {
         return iris_generate_zimage(ctx, prompt, params);
     }
@@ -1280,6 +1450,10 @@ iris_image *iris_generate_with_embeddings(iris_ctx *ctx,
         return NULL;
     }
 
+    if (ctx->is_qwen21) {
+        set_error("Qwen-Image 2.1 generation is not implemented yet");
+        return NULL;
+    }
     if (ctx->is_zimage) {
         return iris_generate_zimage_with_embeddings(ctx, text_emb, text_seq, params);
     }
@@ -2007,6 +2181,11 @@ int iris_text_dim(iris_ctx *ctx) {
 
 const char *iris_license_notice(iris_ctx *ctx) {
     if (!ctx || !ctx->is_non_commercial) return NULL;
+    if (ctx->is_qwen21) {
+        return "This model is released under the Qwen Research License:\n"
+               "https://huggingface.co/Qwen/Qwen-Image-2.1/blob/main/LICENSE\n"
+               "Use of the model and its outputs is restricted by that license.";
+    }
     if (ctx->is_flux3) {
         return "This model is released under the FLUX Kommunity License:\n"
                "non-commercial use, plus commercial use of the outputs for\n"

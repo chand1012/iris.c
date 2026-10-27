@@ -230,9 +230,9 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  -W, --width N         Output width (default: %d)\n", DEFAULT_WIDTH);
     fprintf(stderr, "  -H, --height N        Output height (default: %d)\n", DEFAULT_HEIGHT);
     fprintf(stderr, "  -s, --steps N         Sampling steps (default: auto, 4 distilled / 50 base / 9 zimage /\n");
-    fprintf(stderr, "                        16 flux3 distilled / 50 flux3 base)\n");
+    fprintf(stderr, "                        16 flux3 distilled / 50 flux3 base / 40 qwen21)\n");
     fprintf(stderr, "  -g, --guidance N      CFG guidance scale (default: auto, 1.0 distilled / 4.0 base / 0.0 zimage /\n");
-    fprintf(stderr, "                        0.0 flux3 distilled / 3.5 flux3 base)\n");
+    fprintf(stderr, "                        0.0 flux3 distilled / 3.5 flux3 base / 0.0 qwen21)\n");
     fprintf(stderr, "  -S, --seed N          Random seed (-1 for random)\n");
     fprintf(stderr, "      --linear          Use linear timestep schedule\n");
     fprintf(stderr, "      --power           Use power curve timestep schedule (default alpha: 2.0)\n");
