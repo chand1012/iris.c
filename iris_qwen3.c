@@ -47,6 +47,12 @@
 /* Maximum number of safetensors shards (Qwen3-8B may have >2) */
 #define QWEN3_MAX_SHARDS 16
 
+/* Qwen-Image 2.1 (Qwen3-VL-8B text tower): the pipeline wraps the prompt in
+ * a chat template with this system message and drops the system message's
+ * 14 leading tokens from the hidden states before the transformer. */
+#define QWEN3_QWEN21_DROP_IDX 14
+#define QWEN3_QWEN21_SYSTEM_PROMPT "Comprehend and analyze the provided prompt."
+
 /* ========================================================================
  * Data Structures
  * ======================================================================== */
@@ -301,6 +307,10 @@ static int qwen3_output_layers(const qwen3_model_t *model, int *layers) {
     case QWEN3_EXTRACT_FLUX3:   /* hidden_states[4, 8, ..., 32] */
         for (int i = 0; i < 8; i++) layers[i] = 4 * (i + 1) - 1;
         return 8;
+    case QWEN3_EXTRACT_QWEN21:  /* hidden_states[-1]: last decoder layer,
+                                  before the final RMSNorm */
+        layers[0] = model->num_layers - 1;
+        return 1;
     default:                    /* hidden_states[9, 18, 27] */
         layers[0] = 8;
         layers[1] = 17;
@@ -2020,12 +2030,19 @@ qwen3_encoder_t *qwen3_encoder_load(const char *model_dir, int use_mmap) {
     qwen3_encoder_t *enc = calloc(1, sizeof(qwen3_encoder_t));
     if (!enc) return NULL;
 
-    /* Load tokenizer (Flux3 ships it inside text_encoder/) */
+    /* Load tokenizer (Flux3 ships it inside text_encoder/, Qwen-Image 2.1
+     * in processor/) */
     char tok_path[512];
     snprintf(tok_path, sizeof(tok_path), "%s/tokenizer/tokenizer.json", model_dir);
     FILE *tf = fopen(tok_path, "r");
-    if (tf) fclose(tf);
-    else snprintf(tok_path, sizeof(tok_path), "%s/text_encoder/tokenizer.json", model_dir);
+    if (tf) {
+        fclose(tf);
+    } else {
+        snprintf(tok_path, sizeof(tok_path), "%s/text_encoder/tokenizer.json", model_dir);
+        tf = fopen(tok_path, "r");
+        if (tf) fclose(tf);
+    }
+    if (!tf) snprintf(tok_path, sizeof(tok_path), "%s/processor/tokenizer.json", model_dir);
     enc->tokenizer = qwen3_tokenizer_load(tok_path);
     if (!enc->tokenizer) {
         fprintf(stderr, "qwen3_encoder_load: failed to load tokenizer\n");
@@ -2081,6 +2098,45 @@ float *qwen3_encode_text_ex(qwen3_encoder_t *enc, const char *prompt,
     if (!enc || !enc->tokenizer || !enc->model || !prompt) return NULL;
 
     int mode = enc->model->extraction_mode;
+
+    if (mode == QWEN3_EXTRACT_QWEN21) {
+        /* Qwen-Image 2.1's pipeline tokenizes a chat template with a system
+         * message, does not pad single prompts, and reads the last decoder
+         * layer's output before the final RMSNorm. It then drops the
+         * system message's 14 leading tokens and caps the remainder at 512.
+         * (The 14 count is derived from the tokenized system message, which
+         * is what the official pipeline does.) */
+        int max_len = QWEN3_MAX_SEQ_LEN + QWEN3_QWEN21_DROP_IDX;
+        int ntok;
+        int *tokens = qwen3_tokenize_chat_with_system(enc->tokenizer, prompt,
+                                                      QWEN3_QWEN21_SYSTEM_PROMPT,
+                                                      &ntok, max_len);
+        if (!tokens) return NULL;
+
+        int *attention_mask = malloc(ntok * sizeof(int));
+        for (int i = 0; i < ntok; i++) attention_mask[i] = 1;
+
+        float *embeddings = qwen3_forward(enc->model, tokens, attention_mask, ntok);
+        free(tokens);
+        free(attention_mask);
+        if (!embeddings) return NULL;
+
+        /* Drop the leading system tokens and cap at QWEN3_MAX_SEQ_LEN. */
+        int len = ntok - QWEN3_QWEN21_DROP_IDX;
+        if (len < 0) { free(embeddings); return NULL; }
+        if (len > QWEN3_MAX_SEQ_LEN) len = QWEN3_MAX_SEQ_LEN;
+
+        int hidden = enc->model->hidden_size;
+        float *out = malloc(len * hidden * sizeof(float));
+        memcpy(out, embeddings + QWEN3_QWEN21_DROP_IDX * hidden,
+               len * hidden * sizeof(float));
+        free(embeddings);
+
+        if (out_num_tokens) *out_num_tokens = len;
+        if (out_seq_len) *out_seq_len = len;
+        return out;
+    }
+
     int max_len = (mode == QWEN3_EXTRACT_FLUX3) ? enc->model->max_seq_len
                                                 : QWEN3_MAX_SEQ_LEN;
 

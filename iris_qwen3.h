@@ -34,6 +34,7 @@ extern "C" {
 #define QWEN3_EXTRACT_FLUX     0
 #define QWEN3_EXTRACT_ZIMAGE   1
 #define QWEN3_EXTRACT_FLUX3    2
+#define QWEN3_EXTRACT_QWEN21   3
 
 /* ========================================================================
  * Opaque Types
@@ -63,6 +64,14 @@ void qwen3_tokenizer_free(qwen3_tokenizer_t *tok);
  */
 int *qwen3_tokenize_chat(qwen3_tokenizer_t *tok, const char *prompt,
                          int *num_tokens, int max_len, int skip_think_tags);
+
+/*
+ * Tokenize text with a system message (Qwen-Image 2.1's text encoder):
+ * Format: </think>
+ */
+int *qwen3_tokenize_chat_with_system(qwen3_tokenizer_t *tok, const char *prompt,
+                                     const char *system_prompt,
+                                     int *num_tokens, int max_len);
 
 /*
  * Pad tokens to max_len with PAD token.

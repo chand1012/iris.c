@@ -1102,6 +1102,53 @@ int *qwen3_tokenize_chat(qwen3_tokenizer_t *tok, const char *prompt,
     return tokens;
 }
 
+/* Append s's tokens to the growing buffer, doubling capacity as needed. */
+static void append_tokenized(qwen3_tokenizer_t *tok, const char *s,
+                             int **tokens, int *total, int *capacity, int max_len) {
+    int n;
+    int *ts = qwen3_tokenize(tok, s, &n, max_len - *total);
+    for (int i = 0; i < n && *total < max_len; i++) {
+        if (*total >= *capacity) {
+            *capacity *= 2;
+            *tokens = realloc(*tokens, (*capacity) * sizeof(int));
+        }
+        (*tokens)[(*total)++] = ts[i];
+    }
+    free(ts);
+}
+
+/* Tokenize with a system message (Qwen-Image 2.1's text encoder). The
+ * Qwen3-VL chat template renders each message as </think>
+ * a newline after each closing tag, and the generation prompt adds an
+ * empty  block. */
+int *qwen3_tokenize_chat_with_system(qwen3_tokenizer_t *tok, const char *prompt,
+                                     const char *system_prompt,
+                                     int *num_tokens, int max_len) {
+    if (max_len <= 0) max_len = QWEN3_MAX_SEQ_LEN;
+
+    int capacity = 512;
+    int *tokens = malloc(capacity * sizeof(int));
+    int total = 0;
+
+    if (total < max_len) tokens[total++] = QWEN3_IM_START_ID;
+    append_tokenized(tok, "system\n", &tokens, &total, &capacity, max_len);
+    append_tokenized(tok, system_prompt, &tokens, &total, &capacity, max_len);
+    if (total < max_len) tokens[total++] = QWEN3_IM_END_ID;
+    append_tokenized(tok, "\n", &tokens, &total, &capacity, max_len);
+
+    if (total < max_len) tokens[total++] = QWEN3_IM_START_ID;
+    append_tokenized(tok, "user\n", &tokens, &total, &capacity, max_len);
+    append_tokenized(tok, prompt, &tokens, &total, &capacity, max_len);
+    if (total < max_len) tokens[total++] = QWEN3_IM_END_ID;
+    append_tokenized(tok, "\n", &tokens, &total, &capacity, max_len);
+
+    if (total < max_len) tokens[total++] = QWEN3_IM_START_ID;
+    append_tokenized(tok, "assistant\n", &tokens, &total, &capacity, max_len);
+
+    *num_tokens = total;
+    return tokens;
+}
+
 /*
  * Pad token sequence to max_len with PAD tokens.
  * Returns new array, caller must free original.
