@@ -1019,6 +1019,8 @@ static int qw_forward_dev(qw_transformer_t *tf, const float *z, const float *txt
         iris_dev_swiglu(d->ffn, mlp, d->gate, d->ffn, mlp, N, mlp);
         iris_dev_linear_f32(d->o1, d->att, bl->to_out, N, dim, dim);
         iris_dev_linear_f32(d->o2, d->ffn, bl->mlp_out, N, mlp, dim);
+        /* o1/o2 are GPU-written; flush before the host reads them to sum. */
+        iris_dev_sync();
         for (int seg = 0; seg < 2; seg++) {
             int start = seg ? s_txt : 0, len = seg ? n_img : s_txt;
             if (len <= 0) continue;
@@ -1036,11 +1038,9 @@ static int qw_forward_dev(qw_transformer_t *tf, const float *z, const float *txt
      * n_img*in_ch) elements and would overflow for n_img*dim. */
     {
         float *nf = malloc((size_t)n_img * dim * sizeof(float));
+        /* d->x is f32 (not bf16): download it directly, no bf16 widening. */
         iris_dev_download(nf, d->x + (size_t)s_txt * dim,
-                          (size_t)n_img * dim * sizeof(uint16_t));
-        for (size_t i = 0; i < (size_t)n_img * dim; i++) {
-            uint32_t u = (uint32_t)nf[i] << 16; float f; memcpy(&f, &u, 4); nf[i] = f;
-        }
+                          (size_t)n_img * dim * sizeof(float));
         qw_layernorm(nf, n_img, dim, tf->eps);
         const float *sc = d->vec + d->o_sout;   /* soutT: image-row scale */
         for (size_t i = 0; i < (size_t)n_img * dim; i++) nf[i] *= 1.0f + sc[i % dim];
