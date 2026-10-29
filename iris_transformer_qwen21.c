@@ -997,7 +997,7 @@ static int qw_forward_dev(qw_transformer_t *tf, const float *z, const float *txt
             qw_text_attn_host(tf, d->qkv, d->qkv + dim, d->qkv + 2 * dim, s_txt, kv_host, d->att);
         iris_dev_attention(d->att + (size_t)s_txt * dim, dim, d->qkv + (size_t)s_txt * dim,
                            d->qkv + dim, d->qkv + 2 * dim, 3 * dim,
-                           n_img, N, heads, heads, hd, scale, 0, d->mask);
+                           n_img, N, heads, heads, hd, scale, 0, NULL);
         iris_dev_linear_bf16(d->gate, d->norm, bl->mlp_gate, N, dim, mlp);
         iris_dev_linear_bf16(d->ffn, d->norm, bl->mlp_proj, N, dim, mlp);
         iris_dev_swiglu(d->ffn, mlp, d->gate, d->ffn, mlp, N, mlp);
