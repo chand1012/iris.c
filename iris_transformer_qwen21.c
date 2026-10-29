@@ -204,10 +204,6 @@ static void qw_silu(float *x, int n) {
     for (int i = 0; i < n; i++) x[i] = x[i] / (1.0f + expf(-x[i]));
 }
 
-static void qw_tanh(float *x, int n) {
-    for (int i = 0; i < n; i++) x[i] = tanhf(x[i]);
-}
-
 /* ========================================================================
  * Weight loading
  * ======================================================================== */
@@ -595,6 +591,7 @@ static void qw_block(qw_transformer_t *tf, int b, float *x, float *xm,
     qw_rope_apply(q, n_tok, heads, hd, qk_c, qk_s);
     qw_rope_apply(k, n_tok, heads, hd, qk_c, qk_s);
 
+
     float *attnout = malloc((size_t)n_tok * dim * sizeof(float));
     if (s_txt > 0) {
         qw_seg_attn(q, k, vv, heads, hd, 0, s_txt, s_txt, 1, key_valid, attnout);
@@ -687,7 +684,7 @@ struct qw_dev {
     uint16_t *gate;       /* [seq, mlp_dim] */
     uint16_t *ffn;        /* [seq, mlp_dim] */
     uint16_t *att;        /* [seq, dim] attention output */
-    uint16_t *cat;        /* [seq, dim] (unused, kept simple) */
+    uint16_t *cat;        /* [seq, dim] norm2 stream (second modulated LN) */
     float *o1, *o2;       /* [seq, dim] attention/FFN projection scratch (f32) */
     float *rope_c, *rope_s;  /* [seq, head_dim/2] */
     int *mask;            /* [seq] key validity */
@@ -811,6 +808,7 @@ static int qw_dev_ensure(qw_transformer_t *tf, int seq, size_t in_elems) {
         d->gate= iris_dev_alloc((size_t)seq * mlp * sizeof(uint16_t));
         d->ffn = iris_dev_alloc((size_t)seq * mlp * sizeof(uint16_t));
         d->att = iris_dev_alloc((size_t)seq * dim * sizeof(uint16_t));
+        d->cat = iris_dev_alloc((size_t)seq * dim * sizeof(uint16_t));
         d->o1  = iris_dev_alloc((size_t)seq * dim * sizeof(float));
         d->o2  = iris_dev_alloc((size_t)seq * dim * sizeof(float));
         d->rope_c = iris_dev_alloc((size_t)seq * hd / 2 * sizeof(float));
@@ -1020,24 +1018,37 @@ static int qw_forward_dev(qw_transformer_t *tf, const float *z, const float *txt
         iris_dev_head_norm_rope(dk, dim, bl->norm_k, d->rope_c, d->rope_s, N, heads, hd, tf->eps, 0);
         qw_attn_host(tf, dq, dk, dv, s_txt, n_img, kv_host, d->att);
         if (n_img > 0)
-            iris_dev_attention(d->att + (size_t)s_txt * dim, dim,
-                               dq + (size_t)s_txt * dim, dk, dv, dim,
-                               n_img, N, heads, heads, hd, scale, 0, NULL);
-        iris_dev_linear_bf16(d->gate, d->norm, bl->mlp_gate, N, dim, mlp);
-        iris_dev_linear_bf16(d->ffn, d->norm, bl->mlp_proj, N, dim, mlp);
-        iris_dev_swiglu(d->ffn, mlp, d->gate, d->ffn, mlp, N, mlp);
+        iris_dev_attention(d->att + (size_t)s_txt * dim, dim,
+                           dq + (size_t)s_txt * dim, dk, dv, dim,
+                           n_img, N, heads, heads, hd, scale, 0, d->mask);
         iris_dev_linear_f32(d->o1, d->att, bl->to_out, N, dim, dim);
-        iris_dev_linear_f32(d->o2, d->ffn, bl->mlp_out, N, mlp, dim);
-        /* Two gated residuals, per the DiT block: x += tanh(g1)*attn then
-         * x += tanh(g2)*ffn, with different gates per segment (text uses the
-         * t=0 modulation row, image rows their own). iris_dev_residual takes
-         * the pre-tanh'd gate vector; o1/o2 are distinct device buffers. */
+        /* First gated residual: x += tanh(gate1) * attn_out. The device
+         * residual takes the pre-tanh'd gate vector (host tanh'd rows). */
         for (int seg = 0; seg < 2; seg++) {
             int start = seg ? s_txt : 0, len = seg ? n_img : s_txt;
             if (len <= 0) continue;
             size_t go = seg ? 0 : 2 * dim;   /* text: g10/g20; image: g1T/g2T */
             iris_dev_residual(d->x + (size_t)start * dim, d->o1 + (size_t)start * dim,
                               d->vec + d->o_tg + go, len, dim);
+        }
+        iris_dev_linear_bf16(d->gate, d->cat, bl->mlp_gate, N, dim, mlp);
+        iris_dev_linear_bf16(d->ffn, d->cat, bl->mlp_proj, N, dim, mlp);
+        iris_dev_swiglu(d->ffn, mlp, d->gate, d->ffn, mlp, N, mlp);
+        iris_dev_linear_f32(d->o2, d->ffn, bl->mlp_out, N, mlp, dim);
+        /* Second gated residual, on the norm2 stream: LN(x)*(1+scale2), with x
+         * the *updated* residual stream (after residual1), per the reference
+         * block (img_norm2 + tanh(gate2) * mlp). mod2 = modulation[2*dim:]. */
+        for (int seg = 0; seg < 2; seg++) {
+            int start = seg ? s_txt : 0, len = seg ? n_img : s_txt;
+            if (len <= 0) continue;
+            const float *m = seg ? modT : mod0;
+            iris_dev_layer_norm_mod(d->cat + (size_t)start * dim, d->x + (size_t)start * dim,
+                                    NULL, m + 2 * dim, len, dim, tf->eps);
+        }
+        for (int seg = 0; seg < 2; seg++) {
+            int start = seg ? s_txt : 0, len = seg ? n_img : s_txt;
+            if (len <= 0) continue;
+            size_t go = seg ? 0 : 2 * dim;   /* text: g10/g20; image: g1T/g2T */
             iris_dev_residual(d->x + (size_t)start * dim, d->o2 + (size_t)start * dim,
                               d->vec + d->o_tg + go + dim, len, dim);
         }
