@@ -105,8 +105,8 @@ static int  qw_forward_dev(qw_transformer_t *tf, const float *z, const float *tx
                            const int *txt_mask, int s_txt, int img_h, int img_w,
                            float sigma, float *v);
 static void qw_dev_free(qw_transformer_t *tf);
-static void qw_attn_host(qw_transformer_t *tf, const uint16_t *dqkv,
-                         int s_txt, int n_img, const int *kv, float *dattn);
+static void qw_attn_host(qw_transformer_t *tf, const uint16_t *dq, const uint16_t *dk,
+                         const uint16_t *dv, int s_txt, int n_img, const int *kv, float *dattn);
 #endif
 
 /* ========================================================================
@@ -842,9 +842,9 @@ static int qw_dev_ensure(qw_transformer_t *tf, int seq, size_t in_elems) {
  * qw_seg_attn and the result is uploaded as bf16 (the block reads d->att via
  * linear_f32, which expects a bf16 operand). The large image segment runs
  * on-device via iris_dev_attention. */
-static void qw_attn_host(qw_transformer_t *tf, const uint16_t *dqkv,
-                         int s_txt, int n_img, const int *kv, float *dattn) {
-    (void)n_img; (void)dattn;
+static void qw_attn_host(qw_transformer_t *tf, const uint16_t *dq, const uint16_t *dk,
+                         const uint16_t *dv, int s_txt, int n_img, const int *kv, float *dattn) {
+    (void)n_img;
     if (s_txt <= 0) return;
     int heads = tf->heads, hd = tf->head_dim, dim = tf->dim;
     size_t sz = (size_t)s_txt * dim;      /* text rows only */
@@ -853,16 +853,15 @@ static void qw_attn_host(qw_transformer_t *tf, const uint16_t *dqkv,
     float *k = malloc(sz * sizeof(float));
     float *v = malloc(sz * sizeof(float));
     float *hout = malloc(sz * sizeof(float));
-    uint16_t *bout_unused = NULL; (void)bout_unused;
-    /* Device buffers are CPU-mapped; read qkv in place (the large-copy
-     * download path returns zeros for big buffers here). */
+    /* Device buffers are CPU-mapped; read the compact q/k/v blocks in place
+     * (the large-copy download path returns zeros for big buffers here). */
     for (size_t i = 0; i < sz; i++) {
-        q[i] = qw_bf16_to_f32(dqkv[i]);
-        k[i] = qw_bf16_to_f32(dqkv[dim + i]);
-        v[i] = qw_bf16_to_f32(dqkv[2 * dim + i]);
+        q[i] = qw_bf16_to_f32(dq[i]);
+        k[i] = qw_bf16_to_f32(dk[i]);
+        v[i] = qw_bf16_to_f32(dv[i]);
     }
     qw_seg_attn(q, k, v, heads, hd, 0, s_txt, s_txt, 1, kv, hout);
-    /* Reuse the text q/k/v slots as bf16 scratch (>= s_txt*dim). */
+    /* Reuse the text q slot as bf16 scratch (>= s_txt*dim). */
     uint16_t *b16 = (uint16_t *)q;
     size_t m = 0;
     for (size_t i = 0; i < sz; i++) {
@@ -938,24 +937,28 @@ static int qw_forward_dev(qw_transformer_t *tf, const float *z, const float *txt
     iris_dev_f32_to_bf16(d->vec_b16 + d->o_h1 + dim, h10, dim);
     iris_dev_linear_f32(temb0, d->vec_b16 + d->o_h1 + dim, d->time_lin2, 1, dim, dim);
 
-    /* Modulation rows (shared across all blocks) and output scales. */
+    /* Modulation rows (shared across all blocks) and output scales. The
+     * modulation and norm_out projections are Sequential(SiLU, Linear): the
+     * activation must be applied to temb before the projection. tembT/temb0
+     * are CPU-mapped f32; apply host SiLU in place before the bf16 store
+     * (the f32->bf16 kernel only converts, it does not activate). */
+    float *modT = d->vec + d->o_mod, *mod0 = modT + 4 * dim;
+    float *soutT = d->vec + d->o_sout, *sout0 = soutT + dim;
+    iris_dev_sync();   /* tembT/temb0 must be final before host activation */
+    qw_silu(tembT, dim);
+    qw_silu(temb0, dim);
     iris_dev_f32_to_bf16(d->vec_b16 + d->o_act, tembT, dim);
     iris_dev_f32_to_bf16(d->vec_b16 + d->o_act + dim, temb0, dim);
-    float *modT = d->vec + d->o_mod, *mod0 = modT + 4 * dim;
     iris_dev_linear_f32(modT, d->vec_b16 + d->o_act, d->modulation, 1, dim, 4 * dim);
     iris_dev_linear_f32(mod0, d->vec_b16 + d->o_act + dim, d->modulation, 1, dim, 4 * dim);
-    iris_dev_linear_f32(d->vec + d->o_sout, d->vec_b16 + d->o_act, d->norm_out_lin, 1, dim, dim);
-    iris_dev_linear_f32(d->vec + d->o_sout + dim, d->vec_b16 + d->o_act + dim, d->norm_out_lin, 1, dim, dim);
+    iris_dev_linear_f32(soutT, d->vec_b16 + d->o_act, d->norm_out_lin, 1, dim, dim);
+    iris_dev_linear_f32(sout0, d->vec_b16 + d->o_act + dim, d->norm_out_lin, 1, dim, dim);
 
     /* tanh of the gate rows (iris_dev_residual has no tanh): the device API
      * lacks tanh, so download the two modulation rows, tanh their gate parts
      * on the host, and upload the four gate vectors. */
     {
-        static const float zero[4] = {0,0,0,0};
-        iris_dev_upload(d->vec + d->o_tg,        zero, 0);
         iris_dev_sync();   /* ensure the modulation GEMMs landed before read */
-        iris_dev_download(modT, modT, 4 * dim * sizeof(float));
-        iris_dev_download(mod0, mod0, 4 * dim * sizeof(float));
         float *g1T = d->vec + d->o_tg, *g2T = g1T + dim, *g10 = g2T + dim, *g20 = g10 + dim;
         for (int j = 0; j < dim; j++) { g1T[j] = tanhf(modT[dim + j]);     g2T[j] = tanhf(modT[3 * dim + j]); }
         for (int j = 0; j < dim; j++) { g10[j] = tanhf(mod0[dim + j]);     g20[j] = tanhf(mod0[3 * dim + j]); }
@@ -993,6 +996,11 @@ static int qw_forward_dev(qw_transformer_t *tf, const float *z, const float *txt
     free(qk_c); free(qk_s);
 
     float scale = 1.0f / sqrtf((float)hd);
+    /* q, k, v live as three separate compact [seq, dim] blocks inside the
+     * single d->qkv buffer (the linear kernel writes output row-major with
+     * row-stride = its output width, dim; a 3*dim interleave would overlap). */
+    uint16_t *dq = d->qkv, *dk = d->qkv + (size_t)d->seq * dim,
+             *dv = dk + (size_t)d->seq * dim;
     /* Blocks. */
     for (int b = 0; b < tf->n_layers; b++) {
         qw_dev_block_t *bl = &d->blocks[b];
@@ -1000,19 +1008,20 @@ static int qw_forward_dev(qw_transformer_t *tf, const float *z, const float *txt
             int start = seg ? s_txt : 0, len = seg ? n_img : s_txt;
             if (len <= 0) continue;
             const float *m = seg ? modT : mod0;
+            /* norm1 applies scale only: LN(x)*(1+scale1), no additive shift
+             * (the modulation row's shift slot is the gate, not a shift). */
             iris_dev_layer_norm_mod(d->norm + (size_t)start * dim, d->x + (size_t)start * dim,
-                                    m, m + dim, len, dim, tf->eps);
+                                    NULL, m, len, dim, tf->eps);
         }
-        iris_dev_linear_bf16(d->qkv, d->norm, bl->to_q, N, dim, dim);
-        iris_dev_linear_bf16(d->qkv + dim, d->norm, bl->to_k, N, dim, dim);
-        iris_dev_linear_bf16(d->qkv + 2 * dim, d->norm, bl->to_v, N, dim, dim);
-        iris_dev_head_norm_rope(d->qkv, 3 * dim, bl->norm_q, d->rope_c, d->rope_s, N, heads, hd, tf->eps, 0);
-        iris_dev_head_norm_rope(d->qkv + dim, 3 * dim, bl->norm_k, d->rope_c, d->rope_s, N, heads, hd, tf->eps, 0);
-        qw_attn_host(tf, d->qkv, s_txt, n_img, kv_host, d->att);
+        iris_dev_linear_bf16(dq, d->norm, bl->to_q, N, dim, dim);
+        iris_dev_linear_bf16(dk, d->norm, bl->to_k, N, dim, dim);
+        iris_dev_linear_bf16(dv, d->norm, bl->to_v, N, dim, dim);
+        iris_dev_head_norm_rope(dq, dim, bl->norm_q, d->rope_c, d->rope_s, N, heads, hd, tf->eps, 0);
+        iris_dev_head_norm_rope(dk, dim, bl->norm_k, d->rope_c, d->rope_s, N, heads, hd, tf->eps, 0);
+        qw_attn_host(tf, dq, dk, dv, s_txt, n_img, kv_host, d->att);
         if (n_img > 0)
             iris_dev_attention(d->att + (size_t)s_txt * dim, dim,
-                               d->qkv + (size_t)s_txt * dim, d->qkv + dim,
-                               d->qkv + 2 * dim, 3 * dim,
+                               dq + (size_t)s_txt * dim, dk, dv, dim,
                                n_img, N, heads, heads, hd, scale, 0, NULL);
         iris_dev_linear_bf16(d->gate, d->norm, bl->mlp_gate, N, dim, mlp);
         iris_dev_linear_bf16(d->ffn, d->norm, bl->mlp_proj, N, dim, mlp);
