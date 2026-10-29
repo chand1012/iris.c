@@ -1019,14 +1019,18 @@ static int qw_forward_dev(qw_transformer_t *tf, const float *z, const float *txt
         iris_dev_swiglu(d->ffn, mlp, d->gate, d->ffn, mlp, N, mlp);
         iris_dev_linear_f32(d->o1, d->att, bl->to_out, N, dim, dim);
         iris_dev_linear_f32(d->o2, d->ffn, bl->mlp_out, N, mlp, dim);
-        /* o1/o2 are GPU-written; flush before the host reads them to sum. */
-        iris_dev_sync();
+        /* Two gated residuals, per the DiT block: x += tanh(g1)*attn then
+         * x += tanh(g2)*ffn, with different gates per segment (text uses the
+         * t=0 modulation row, image rows their own). iris_dev_residual takes
+         * the pre-tanh'd gate vector; o1/o2 are distinct device buffers. */
         for (int seg = 0; seg < 2; seg++) {
             int start = seg ? s_txt : 0, len = seg ? n_img : s_txt;
             if (len <= 0) continue;
-            float *o = d->o1 + (size_t)start * dim, *o2 = d->o2 + (size_t)start * dim;
-            for (size_t e = 0; e < (size_t)len * dim; e++) o[e] += o2[e];
-            iris_dev_residual(d->x + (size_t)start * dim, o, d->vec + d->o_tg + (seg ? 2 * dim : 0), len, dim);
+            size_t go = seg ? 0 : 2 * dim;   /* text: g10/g20; image: g1T/g2T */
+            iris_dev_residual(d->x + (size_t)start * dim, d->o1 + (size_t)start * dim,
+                              d->vec + d->o_tg + go, len, dim);
+            iris_dev_residual(d->x + (size_t)start * dim, d->o2 + (size_t)start * dim,
+                              d->vec + d->o_tg + go + dim, len, dim);
         }
         iris_dev_sync();
     }
