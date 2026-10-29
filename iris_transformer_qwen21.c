@@ -105,9 +105,8 @@ static int  qw_forward_dev(qw_transformer_t *tf, const float *z, const float *tx
                            const int *txt_mask, int s_txt, int img_h, int img_w,
                            float sigma, float *v);
 static void qw_dev_free(qw_transformer_t *tf);
-static void qw_text_attn_host(qw_transformer_t *tf, const uint16_t *dq,
-                              const uint16_t *dk, const uint16_t *dv,
-                              int s_txt, const int *kv, float *dattn);
+static void qw_attn_host(qw_transformer_t *tf, const uint16_t *dqkv,
+                         int s_txt, int n_img, const int *kv, float *dattn);
 #endif
 
 /* ========================================================================
@@ -834,25 +833,30 @@ static int qw_dev_ensure(qw_transformer_t *tf, int seq, size_t in_elems) {
 /* Metal's iris_dev_attention is non-causal only. The text segment (<= 512
  * tokens, and small relative to the image) runs causal attention on the host
  * by downloading its q/k/v rows, so the whole image block stays on-device. */
-static void qw_text_attn_host(qw_transformer_t *tf, const uint16_t *dq,
-                              const uint16_t *dk, const uint16_t *dv,
-                              int s_txt, const int *kv, float *dattn) {
-    int heads = tf->heads, hd = tf->head_dim, ldi = 3 * tf->dim;
-    int sz = s_txt * ldi;
-    float *q = malloc((size_t)sz * sizeof(float));
-    float *k = malloc((size_t)sz * sizeof(float));
-    float *v = malloc((size_t)sz * sizeof(float));
-    float *hout = malloc((size_t)s_txt * tf->dim * sizeof(float));
-    iris_dev_download(q, dq, (size_t)sz * 2);
-    iris_dev_download(k, dk, (size_t)sz * 2);
-    iris_dev_download(v, dv, (size_t)sz * 2);
-    for (int i = 0; i < sz; i++) {
+/* Block-causal attention on the host. The fused SDPA graph faults in this
+ * build, so q/k/v (already computed on-device, bf16) are downloaded, the two
+ * segments run through the CPU-verified qw_seg_attn, and the result is
+ * uploaded. Only the small attention tensor crosses; GEMMs stay on-device. */
+static void qw_attn_host(qw_transformer_t *tf, const uint16_t *dqkv,
+                         int s_txt, int n_img, const int *kv, float *dattn) {
+    int heads = tf->heads, hd = tf->head_dim, dim = tf->dim;
+    int N = s_txt + n_img;
+    size_t sz = (size_t)N * dim;
+    float *q = malloc(sz * sizeof(float));
+    float *k = malloc(sz * sizeof(float));
+    float *v = malloc(sz * sizeof(float));
+    float *hout = malloc(sz * sizeof(float));
+    iris_dev_download(q, dqkv, sz * 2);
+    iris_dev_download(k, dqkv + dim, sz * 2);
+    iris_dev_download(v, dqkv + 2 * dim, sz * 2);
+    for (size_t i = 0; i < sz; i++) {
         uint32_t u = (uint32_t)q[i] << 16; float f; memcpy(&f, &u, 4); q[i] = f;
         u = (uint32_t)k[i] << 16; memcpy(&f, &u, 4); k[i] = f;
         u = (uint32_t)v[i] << 16; memcpy(&f, &u, 4); v[i] = f;
     }
-    qw_seg_attn(q, k, v, heads, hd, 0, s_txt, s_txt, 1, kv, hout);
-    iris_dev_upload(dattn, hout, (size_t)s_txt * tf->dim * sizeof(float));
+    if (s_txt > 0) qw_seg_attn(q, k, v, heads, hd, 0, s_txt, s_txt, 1, kv, hout);
+    if (n_img > 0) qw_seg_attn(q, k, v, heads, hd, s_txt, N, N, 0, kv, hout);
+    iris_dev_upload(dattn, hout, sz * sizeof(float));
     free(q); free(k); free(v); free(hout);
 }
 
@@ -993,11 +997,7 @@ static int qw_forward_dev(qw_transformer_t *tf, const float *z, const float *txt
         iris_dev_linear_bf16(d->qkv + 2 * dim, d->norm, bl->to_v, N, dim, dim);
         iris_dev_head_norm_rope(d->qkv, 3 * dim, bl->norm_q, d->rope_c, d->rope_s, N, heads, hd, tf->eps, 0);
         iris_dev_head_norm_rope(d->qkv + dim, 3 * dim, bl->norm_k, d->rope_c, d->rope_s, N, heads, hd, tf->eps, 0);
-        if (s_txt > 0)
-            qw_text_attn_host(tf, d->qkv, d->qkv + dim, d->qkv + 2 * dim, s_txt, kv_host, d->att);
-        iris_dev_attention(d->att + (size_t)s_txt * dim, dim, d->qkv + (size_t)s_txt * dim,
-                           d->qkv + dim, d->qkv + 2 * dim, 3 * dim,
-                           n_img, N, heads, heads, hd, scale, 0, NULL);
+        qw_attn_host(tf, d->qkv, s_txt, n_img, kv_host, d->att);
         iris_dev_linear_bf16(d->gate, d->norm, bl->mlp_gate, N, dim, mlp);
         iris_dev_linear_bf16(d->ffn, d->norm, bl->mlp_proj, N, dim, mlp);
         iris_dev_swiglu(d->ffn, mlp, d->gate, d->ffn, mlp, N, mlp);
