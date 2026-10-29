@@ -59,6 +59,15 @@ typedef struct iris_ctx iris_ctx;
 typedef struct iris_image iris_image;
 typedef struct iris_tokenizer iris_tokenizer;
 
+/* Qwen-Image 2.1 VAE: 64-channel RGBA, 16x spatial (iris_vae_qwen.c) */
+typedef struct iris_vae_qwen iris_vae_qwen_t;
+iris_vae_qwen_t *iris_vae_qwen_load(const char *vae_dir);
+void iris_vae_qwen_free(iris_vae_qwen_t *v);
+float *iris_vae_qwen_encode(iris_vae_qwen_t *v, const float *rgba, int H, int W, int tile,
+                            int *out_h, int *out_w);
+float *iris_vae_qwen_decode(iris_vae_qwen_t *v, const float *latents, int lh, int lw, int tile,
+                            int *out_h, int *out_w);
+
 /* ========================================================================
  * Image Structure
  * ======================================================================== */

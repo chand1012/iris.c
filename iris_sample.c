@@ -258,10 +258,12 @@ float *iris_schedule_qwen21(int num_steps, int image_seq_len,
         schedule[i] = emu / (emu + (1.0f / raw - 1.0f));
     }
 
-    /* Stretch so the final value equals shift_terminal. */
-    float scale = (1.0f - schedule[num_steps - 1]) / (1.0f - shift_terminal);
-    for (int i = 0; i < num_steps; i++) {
-        schedule[i] = 1.0f - (1.0f - schedule[i]) / scale;
+    /* Stretch so the final value equals shift_terminal (no-op for one step:
+     * there is no room between sigma=1 and the terminal value). */
+    if (num_steps > 1) {
+        float scale = (1.0f - schedule[num_steps - 1]) / (1.0f - shift_terminal);
+        for (int i = 0; i < num_steps; i++)
+            schedule[i] = 1.0f - (1.0f - schedule[i]) / scale;
     }
     schedule[num_steps] = 0.0f;
 

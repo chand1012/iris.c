@@ -28,3 +28,4 @@ documents/
 *.a
 *.so
 *.dylib
+qwen-image-*/

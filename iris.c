@@ -136,6 +136,19 @@ extern float *iris_sample_euler_flux3(void *transformer,
                                       float guidance,
                                       void (*progress_callback)(int step, int total));
 
+/* Qwen-Image 2.1 transformer + sampling (iris_transformer_qwen21.c) */
+extern qw_transformer_t *qw_transformer_load(const char *transformer_dir,
+                                             int dim, int heads, int head_dim,
+                                             int n_layers, int in_ch, int ctx_dim,
+                                             int mlp_ratio, const int axes[3],
+                                             float eps, int causal);
+extern void qw_transformer_free(qw_transformer_t *tf);
+extern float *iris_sample_euler_qwen21(qw_transformer_t *tf, float *z,
+                                       int img_h, int img_w, const float *txt,
+                                       int s_txt, const int *txt_mask,
+                                       const float *schedule, int num_steps,
+                                       void (*progress)(int step, int total));
+
 /* Z-Image transformer and sampling */
 typedef struct zi_transformer zi_transformer_t;
 extern zi_transformer_t *zi_transformer_load_safetensors(const char *model_dir,
@@ -221,6 +234,7 @@ struct iris_ctx {
     zi_transformer_t *zi_transformer;
     iris_transformer_flux3_t *flux3_transformer;
     qw_transformer_t *qw_transformer;
+    iris_vae_qwen_t *qw_vae;
 
     /* Configuration */
     int max_width;
@@ -249,6 +263,7 @@ struct iris_ctx {
     /* Qwen-Image 2.1 config (from transformer/config.json) */
     int qw_num_heads;   /* Attention heads (32) */
     int qw_head_dim;    /* Head dim (128) */
+    int qw_dim;         /* Transformer hidden dim (heads * head_dim = 4096) */
     int qw_n_layers;    /* Single-stream layers (32) */
     int qw_in_channels; /* Latent channels (64) */
     int qw_context_dim; /* Text encoder hidden dim (4096) */
@@ -531,6 +546,7 @@ iris_ctx *iris_load_dir(const char *model_dir) {
                         }
                     }
                 }
+                ctx->qw_dim = ctx->qw_num_heads * ctx->qw_head_dim;  /* 4096 */
                 ctx->text_dim = ctx->qw_context_dim;  /* 4096 */
             }
         }
@@ -705,6 +721,8 @@ void iris_free(iris_ctx *ctx) {
     iris_transformer_free_flux(ctx->transformer);
     iris_transformer_free_zimage(ctx->zi_transformer);
     iris_transformer_free_flux3(ctx->flux3_transformer);
+    qw_transformer_free(ctx->qw_transformer);
+    iris_vae_qwen_free(ctx->qw_vae);
 
     free(ctx);
 }
@@ -803,6 +821,27 @@ static int iris_load_flux3_transformer_if_needed(iris_ctx *ctx) {
     return 1;
 }
 
+/* Load Qwen-Image 2.1 transformer on-demand if not already loaded */
+static int iris_load_qw_transformer_if_needed(iris_ctx *ctx) {
+    if (ctx->qw_transformer) return 1;
+
+    if (iris_phase_callback) iris_phase_callback("Loading Qwen-Image 2.1 transformer", 0);
+    char path[512];
+    snprintf(path, sizeof(path), "%s/transformer", ctx->model_dir);
+    ctx->qw_transformer = qw_transformer_load(
+        path, ctx->qw_dim, ctx->qw_num_heads, ctx->qw_head_dim,
+        ctx->qw_n_layers, ctx->qw_in_channels, ctx->qw_context_dim,
+        ctx->qw_mlp_ratio, ctx->qw_axes_dims, ctx->qw_eps,
+        ctx->qw_causal_condition);
+    if (iris_phase_callback) iris_phase_callback("Loading Qwen-Image 2.1 transformer", 1);
+
+    if (!ctx->qw_transformer) {
+        set_error("Failed to load Qwen-Image 2.1 transformer");
+        return 0;
+    }
+    return 1;
+}
+
 /* Load Z-Image transformer on-demand if not already loaded */
 static int iris_load_zimage_transformer_if_needed(iris_ctx *ctx) {
     if (ctx->zi_transformer) return 1;  /* Already loaded */
@@ -870,6 +909,7 @@ float *iris_encode_text(iris_ctx *ctx, const char *prompt, int *out_seq_len) {
 
     /* Set extraction mode: which hidden states form the embeddings */
     qwen3_set_extraction_mode(ctx->qwen3_encoder,
+        ctx->is_qwen21 ? QWEN3_EXTRACT_QWEN21 :
         ctx->is_zimage ? QWEN3_EXTRACT_ZIMAGE :
         ctx->is_flux3 ? QWEN3_EXTRACT_FLUX3 : QWEN3_EXTRACT_FLUX);
 
@@ -1016,6 +1056,110 @@ static iris_image *iris_generate_zimage(iris_ctx *ctx, const char *prompt,
 /* FLUX.3 txt2img from pre-computed embeddings: denoise a noise latent
  * [128, H/16, W/16] with the FLUX.3 Euler sampler (CFG when uncond_emb is
  * given) and decode it with the (FLUX.2) VAE. */
+/* ========================================================================
+ * Qwen-Image 2.1: text2img (single-stream DiT, no CFG, 64-ch RGBA VAE)
+ * ======================================================================== */
+static iris_image *iris_generate_qwen21(iris_ctx *ctx, const char *prompt,
+                                        const iris_params *params) {
+    iris_params p = params ? *params : (iris_params)IRIS_PARAMS_DEFAULT;
+    if (p.width <= 0) p.width = IRIS_DEFAULT_WIDTH;
+    if (p.height <= 0) p.height = IRIS_DEFAULT_HEIGHT;
+    if (p.num_steps <= 0) p.num_steps = ctx->default_steps;
+
+    p.width = (p.width / 16) * 16;
+    p.height = (p.height / 16) * 16;
+    if (p.width < 64) p.width = 64;
+    if (p.height < 64) p.height = 64;
+    if (p.width > IRIS_VAE_MAX_DIM || p.height > IRIS_VAE_MAX_DIM) {
+        set_error("Image dimensions exceed maximum (1792x1792)");
+        return NULL;
+    }
+
+    int text_seq = 0;
+    float *text_emb = iris_encode_text(ctx, prompt, &text_seq);
+    if (!text_emb) {
+        set_error("Failed to encode prompt");
+        return NULL;
+    }
+
+    /* Release the text encoder before loading the transformer so only one
+     * large model is resident at a time (the 64-ch VAE is small and stays). */
+    iris_release_text_encoder(ctx);
+    if (!iris_load_qw_transformer_if_needed(ctx)) {
+        free(text_emb);
+        return NULL;
+    }
+    if (!ctx->qw_vae) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/vae", ctx->model_dir);
+        if (iris_phase_callback) iris_phase_callback("Loading VAE", 0);
+        ctx->qw_vae = iris_vae_qwen_load(path);
+        if (iris_phase_callback) iris_phase_callback("Loading VAE", 1);
+        if (!ctx->qw_vae) {
+            free(text_emb);
+            set_error("Failed to load Qwen-Image 2.1 VAE");
+            return NULL;
+        }
+    }
+
+    int lh = p.height / 16, lw = p.width / 16;
+    int n_img = lh * lw;
+    int nch = ctx->qw_in_channels;   /* 64 */
+    int64_t seed = (p.seed < 0) ? (int64_t)time(NULL) : p.seed;
+
+    /* Position-major standard-normal latents [h*w, 64]; the sampler updates
+     * this buffer in place and returns it. */
+    float *z = malloc((size_t)n_img * nch * sizeof(float));
+    if (seed >= 0) iris_rng_seed((uint64_t)seed);
+    iris_randn(z, n_img * nch);
+
+    float *schedule = iris_selected_qwen21_schedule(
+        &p, n_img, ctx->qw_shift_base, ctx->qw_shift_max,
+        ctx->qw_shift_base_len, ctx->qw_shift_max_len, ctx->qw_shift_terminal);
+    float *latent = iris_sample_euler_qwen21(ctx->qw_transformer, z, lh, lw,
+                                             text_emb, text_seq, NULL,
+                                             schedule, p.num_steps, NULL);
+    free(schedule);
+    free(text_emb);
+    if (!latent) {
+        set_error("Sampling failed");
+        return NULL;
+    }
+
+    /* The transformer works on position-major latents [h*w, 64]; the VAE
+     * decoder takes channel-major [64, lh, lw]. Transpose before decode. */
+    float *lat_cm = malloc((size_t)n_img * nch * sizeof(float));
+    for (int i = 0; i < n_img; i++)
+        for (int c = 0; c < nch; c++)
+            lat_cm[(size_t)c * n_img + i] = latent[(size_t)i * nch + c];
+
+    if (iris_phase_callback) iris_phase_callback("decoding image", 0);
+    int oh = 0, ow = 0;
+    float *rgba = iris_vae_qwen_decode(ctx->qw_vae, lat_cm, lh, lw, 1, &oh, &ow);
+    free(lat_cm);
+    free(latent);
+    if (iris_phase_callback) iris_phase_callback("decoding image", 1);
+    if (!rgba) {
+        set_error("VAE decode failed");
+        return NULL;
+    }
+
+    /* Planar [4, H, W] in [-1, 1] (the Qwen VAE decode range) -> interleaved
+     * [H*W, 4] uint8, mapping [-1,1] -> [0,255]. */
+    iris_image *img = iris_image_create(ow, oh, 4);
+    for (int ch = 0; ch < 4; ch++)
+        for (int y = 0; y < oh; y++) {
+            const float *plane = rgba + (size_t)ch * oh * ow + (size_t)y * ow;
+            uint8_t *dst = img->data + (size_t)y * ow * 4 + ch;
+            for (int x = 0; x < ow; x++) {
+                float val = plane[x] * 127.5f + 127.5f;
+                dst[x * 4] = (uint8_t)(val < 0.0f ? 0.0f : val > 255.0f ? 255.0f : val + 0.5f);
+            }
+        }
+    free(rgba);
+    return img;
+}
+
 static iris_image *iris_generate_flux3_with_embeddings(iris_ctx *ctx,
                                                        const float *text_emb, int text_seq,
                                                        const float *uncond_emb, int uncond_seq,
@@ -1313,8 +1457,7 @@ iris_image *iris_generate(iris_ctx *ctx, const char *prompt,
 
     /* Route to model-specific pipelines */
     if (ctx->is_qwen21) {
-        set_error("Qwen-Image 2.1 generation is not implemented yet");
-        return NULL;
+        return iris_generate_qwen21(ctx, prompt, params);
     }
     if (ctx->is_zimage) {
         return iris_generate_zimage(ctx, prompt, params);
