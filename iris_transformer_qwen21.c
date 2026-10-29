@@ -837,26 +837,40 @@ static int qw_dev_ensure(qw_transformer_t *tf, int seq, size_t in_elems) {
  * build, so q/k/v (already computed on-device, bf16) are downloaded, the two
  * segments run through the CPU-verified qw_seg_attn, and the result is
  * uploaded. Only the small attention tensor crosses; GEMMs stay on-device. */
+/* Text-segment attention on the host. Device SDPA is non-causal only, so the
+ * small causal text block (few dozen tokens) runs through the CPU-verified
+ * qw_seg_attn and the result is uploaded as bf16 (the block reads d->att via
+ * linear_f32, which expects a bf16 operand). The large image segment runs
+ * on-device via iris_dev_attention. */
 static void qw_attn_host(qw_transformer_t *tf, const uint16_t *dqkv,
                          int s_txt, int n_img, const int *kv, float *dattn) {
+    (void)n_img; (void)dattn;
+    if (s_txt <= 0) return;
     int heads = tf->heads, hd = tf->head_dim, dim = tf->dim;
-    int N = s_txt + n_img;
-    size_t sz = (size_t)N * dim;
+    size_t sz = (size_t)s_txt * dim;      /* text rows only */
+    iris_dev_sync();
     float *q = malloc(sz * sizeof(float));
     float *k = malloc(sz * sizeof(float));
     float *v = malloc(sz * sizeof(float));
     float *hout = malloc(sz * sizeof(float));
-    iris_dev_download(q, dqkv, sz * 2);
-    iris_dev_download(k, dqkv + dim, sz * 2);
-    iris_dev_download(v, dqkv + 2 * dim, sz * 2);
+    uint16_t *bout_unused = NULL; (void)bout_unused;
+    /* Device buffers are CPU-mapped; read qkv in place (the large-copy
+     * download path returns zeros for big buffers here). */
     for (size_t i = 0; i < sz; i++) {
-        uint32_t u = (uint32_t)q[i] << 16; float f; memcpy(&f, &u, 4); q[i] = f;
-        u = (uint32_t)k[i] << 16; memcpy(&f, &u, 4); k[i] = f;
-        u = (uint32_t)v[i] << 16; memcpy(&f, &u, 4); v[i] = f;
+        q[i] = qw_bf16_to_f32(dqkv[i]);
+        k[i] = qw_bf16_to_f32(dqkv[dim + i]);
+        v[i] = qw_bf16_to_f32(dqkv[2 * dim + i]);
     }
-    if (s_txt > 0) qw_seg_attn(q, k, v, heads, hd, 0, s_txt, s_txt, 1, kv, hout);
-    if (n_img > 0) qw_seg_attn(q, k, v, heads, hd, s_txt, N, N, 0, kv, hout);
-    iris_dev_upload(dattn, hout, sz * sizeof(float));
+    qw_seg_attn(q, k, v, heads, hd, 0, s_txt, s_txt, 1, kv, hout);
+    /* Reuse the text q/k/v slots as bf16 scratch (>= s_txt*dim). */
+    uint16_t *b16 = (uint16_t *)q;
+    size_t m = 0;
+    for (size_t i = 0; i < sz; i++) {
+        uint32_t u; memcpy(&u, &hout[i], 4);
+        u += 0x8000u;                       /* round-to-nearest */
+        b16[m++] = (uint16_t)(u >> 16);
+    }
+    iris_dev_upload(dattn, b16, sz * sizeof(uint16_t));
     free(q); free(k); free(v); free(hout);
 }
 
@@ -876,7 +890,6 @@ static int qw_forward_dev(qw_transformer_t *tf, const float *z, const float *txt
         fprintf(stderr, "Qwen-Image 2.1: GPU allocation failed for %d tokens\n", N);
         return 0;
     }
-    if (getenv("QW_DBG")) fprintf(stderr, "[qd] ensure ok N=%d\n", N);
 
     /* Text projection on the host (only a few dozen tokens; needs the
      * zero-centered RMSNorm and GELU that the device API lacks). Result rows
@@ -901,7 +914,6 @@ static int qw_forward_dev(qw_transformer_t *tf, const float *z, const float *txt
     }
 
     /* Image latents -> x[s_txt:]. */
-    if (getenv("QW_DBG")) fprintf(stderr, "[qd] after text proj\n");
     iris_dev_upload(d->in_f32, z, (size_t)n_img * tf->in_ch * sizeof(float));
     iris_dev_f32_to_bf16(d->in_b16, d->in_f32, (size_t)n_img * tf->in_ch);
     iris_dev_linear_f32(d->x + (size_t)s_txt * dim, d->in_b16, d->img_in,
@@ -941,6 +953,7 @@ static int qw_forward_dev(qw_transformer_t *tf, const float *z, const float *txt
     {
         static const float zero[4] = {0,0,0,0};
         iris_dev_upload(d->vec + d->o_tg,        zero, 0);
+        iris_dev_sync();   /* ensure the modulation GEMMs landed before read */
         iris_dev_download(modT, modT, 4 * dim * sizeof(float));
         iris_dev_download(mod0, mod0, 4 * dim * sizeof(float));
         float *g1T = d->vec + d->o_tg, *g2T = g1T + dim, *g10 = g2T + dim, *g20 = g10 + dim;
@@ -981,10 +994,8 @@ static int qw_forward_dev(qw_transformer_t *tf, const float *z, const float *txt
 
     float scale = 1.0f / sqrtf((float)hd);
     /* Blocks. */
-    if (getenv("QW_DBG")) fprintf(stderr, "[qd] before blocks\n");
     for (int b = 0; b < tf->n_layers; b++) {
         qw_dev_block_t *bl = &d->blocks[b];
-        if (getenv("QW_DBG") && b < 2) fprintf(stderr, "[qd] block %d\n", b);
         for (int seg = 0; seg < 2; seg++) {
             int start = seg ? s_txt : 0, len = seg ? n_img : s_txt;
             if (len <= 0) continue;
@@ -998,6 +1009,11 @@ static int qw_forward_dev(qw_transformer_t *tf, const float *z, const float *txt
         iris_dev_head_norm_rope(d->qkv, 3 * dim, bl->norm_q, d->rope_c, d->rope_s, N, heads, hd, tf->eps, 0);
         iris_dev_head_norm_rope(d->qkv + dim, 3 * dim, bl->norm_k, d->rope_c, d->rope_s, N, heads, hd, tf->eps, 0);
         qw_attn_host(tf, d->qkv, s_txt, n_img, kv_host, d->att);
+        if (n_img > 0)
+            iris_dev_attention(d->att + (size_t)s_txt * dim, dim,
+                               d->qkv + (size_t)s_txt * dim, d->qkv + dim,
+                               d->qkv + 2 * dim, 3 * dim,
+                               n_img, N, heads, heads, hd, scale, 0, NULL);
         iris_dev_linear_bf16(d->gate, d->norm, bl->mlp_gate, N, dim, mlp);
         iris_dev_linear_bf16(d->ffn, d->norm, bl->mlp_proj, N, dim, mlp);
         iris_dev_swiglu(d->ffn, mlp, d->gate, d->ffn, mlp, N, mlp);
@@ -1013,26 +1029,28 @@ static int qw_forward_dev(qw_transformer_t *tf, const float *z, const float *txt
         iris_dev_sync();
     }
 
-    /* norm_out: LN (no shift/scale) then * (1 + scale_row), then proj_out on
-     * the image rows. The device API has no per-row bf16 scale, so scale in a
-     * host f32 round-trip and re-stash as bf16 in a scratch buffer. */
-    iris_dev_layer_norm_mod(d->norm, d->x, NULL, NULL, N, dim, tf->eps);
+    /* norm_out: LayerNorm (no shift/scale) then * (1 + soutT), then proj_out
+     * on the image rows. The device API faults on a NULL scale/shift LN, so do
+     * the LN and per-row scale on the host and re-stash bf16. The upload goes
+     * through d->o1 (N*dim f32): d->in_f32 is only max(s_txt*ctx,
+     * n_img*in_ch) elements and would overflow for n_img*dim. */
     {
-        float *nf = d->o1;   /* device f32 scratch (>= n_img*dim) */
-        iris_dev_download(nf, d->norm + (size_t)s_txt * dim, (size_t)n_img * dim * sizeof(uint16_t));
+        float *nf = malloc((size_t)n_img * dim * sizeof(float));
+        iris_dev_download(nf, d->x + (size_t)s_txt * dim,
+                          (size_t)n_img * dim * sizeof(uint16_t));
         for (size_t i = 0; i < (size_t)n_img * dim; i++) {
             uint32_t u = (uint32_t)nf[i] << 16; float f; memcpy(&f, &u, 4); nf[i] = f;
         }
-        const float *sc = d->vec + d->o_sout;   /* image row -> soutT */
+        qw_layernorm(nf, n_img, dim, tf->eps);
+        const float *sc = d->vec + d->o_sout;   /* soutT: image-row scale */
         for (size_t i = 0; i < (size_t)n_img * dim; i++) nf[i] *= 1.0f + sc[i % dim];
-        /* Re-upload as bf16 into the att buffer (>= n_img*dim) and project. */
-        iris_dev_upload(d->in_f32, nf, (size_t)n_img * dim * sizeof(float));
-        iris_dev_f32_to_bf16(d->att, d->in_f32, (size_t)n_img * dim);
-        iris_dev_linear_f32(d->o1, d->att, d->proj_out, n_img, dim, tf->in_ch);
-    if (getenv("QW_DBG")) fprintf(stderr, "[qd] after norm_out\n");
+        iris_dev_upload(d->o1, nf, (size_t)n_img * dim * sizeof(float));
+        free(nf);
+        iris_dev_f32_to_bf16(d->att, d->o1, (size_t)n_img * dim);
+        iris_dev_linear_f32(d->in_f32, d->att, d->proj_out, n_img, dim, tf->in_ch);
     }
     iris_dev_sync();
-    iris_dev_download(v, d->o1, (size_t)n_img * tf->in_ch * sizeof(float));
+    iris_dev_download(v, d->in_f32, (size_t)n_img * tf->in_ch * sizeof(float));
     return 1;
 }
 #endif /* IRIS_DEV */
