@@ -23,10 +23,25 @@
 #include <math.h>
 #include <glob.h>
 
+/* Qwen-Image 2.1 Metal path is work-in-progress: the device forward faults in
+ * the block loop (an MPSGraph fault at the second block's first GEMM). Until
+ * that is fixed, this file uses the verified CPU path even on Metal builds
+ * (IRIS_DEV). Define QW_ENABLE_METAL to compile and wire the device path. */
+#if defined(IRIS_DEV) && !defined(QW_ENABLE_METAL)
+#undef IRIS_DEV
+#endif
+
+#ifdef IRIS_DEV
+#include "iris_dev.h"
+#endif
+
+/* cblas_sgemm comes from the BLAS header for this build target: Accelerate on
+ * Apple (IRIS_USE_ACCELERATE, set by the Makefile alongside
+ * ACCELERATE_NEW_LAPACK), cblas.h under USE_OPENBLAS. */
 #ifdef USE_BLAS
-#ifdef __APPLE__
+#if defined(IRIS_USE_ACCELERATE)
 #include <Accelerate/Accelerate.h>
-#else
+#elif defined(USE_OPENBLAS)
 #include <cblas.h>
 #endif
 #endif
@@ -76,9 +91,24 @@ struct qw_transformer {
      * them. Released in qw_transformer_free. */
     safetensors_file_t **shards;
     int nshards;
+
+#ifdef IRIS_DEV
+    struct qw_dev *dev;   /* device (Metal) copy of the model; NULL = CPU path */
+#endif
 };
 
 typedef struct qw_transformer qw_transformer_t;
+
+#ifdef IRIS_DEV
+static int  qw_dev_load(qw_transformer_t *tf);
+static int  qw_forward_dev(qw_transformer_t *tf, const float *z, const float *txt,
+                           const int *txt_mask, int s_txt, int img_h, int img_w,
+                           float sigma, float *v);
+static void qw_dev_free(qw_transformer_t *tf);
+static void qw_text_attn_host(qw_transformer_t *tf, const uint16_t *dq,
+                              const uint16_t *dk, const uint16_t *dv,
+                              int s_txt, const int *kv, float *dattn);
+#endif
 
 /* ========================================================================
  * Basic building blocks
@@ -334,11 +364,17 @@ qw_transformer_t *qw_transformer_load(const char *transformer_dir,
     printf("Qwen-Image 2.1 transformer loaded: %d layers, dim %d, "
            "%d heads x %d, mlp %d\n",
            n_layers, dim, heads, head_dim, dim * mlp_ratio);
+#ifdef IRIS_DEV
+    if (iris_dev_available()) qw_dev_load(tf);
+#endif
     return tf;
 }
 
 void qw_transformer_free(qw_transformer_t *tf) {
     if (!tf) return;
+#ifdef IRIS_DEV
+    qw_dev_free(tf);
+#endif
     /* The big bf16 GEMM weights are zero-copy pointers into the shard mmap:
      * closing the files releases them (do not free the pointers). Only the
      * small norm vectors are malloc'd f32 and are freed here. */
@@ -622,13 +658,399 @@ static void qw_block(qw_transformer_t *tf, int b, float *x, float *xm,
  * sigma:      current flow-matching sigma (0..1)
  * v:          [n_img * in_ch] predicted velocity (output)
  */
+#ifdef IRIS_DEV
+/* ========================================================================
+ * GPU forward (Metal). Weights are uploaded once as bf16 (their native
+ * on-disk format); activations run bf16 with f32 accumulation. The block
+ * math mirrors qw_block(); block-causal attention runs as two calls: the
+ * text segment causal over text keys, the image segment non-causal over all
+ * keys, both gated by the per-token key-validity mask.
+ * ======================================================================== */
+
+typedef struct {
+    uint16_t *to_q, *to_k, *to_v, *to_out;   /* [dim, dim] */
+    uint16_t *mlp_gate, *mlp_proj, *mlp_out; /* gate/up [mlp,dim], out [dim,mlp] */
+    float *norm_q, *norm_k;                  /* [head_dim] */
+} qw_dev_block_t;
+
+struct qw_dev {
+    uint16_t *img_in, *txt_in, *txt_out, *time_lin1, *time_lin2;
+    uint16_t *modulation, *norm_out_lin, *proj_out;
+    float *txt_norm_w;                        /* [ctx_dim] zero-centered */
+    qw_dev_block_t *blocks;
+    /* modulation-row layout offsets within vec / vec_b16 (in elements). */
+    int o_sin, o_h1, o_act, o_temb, o_mod, o_sout, o_tg, vecN;
+    /* activations, sized for seq tokens */
+    int seq;
+    float *x;             /* [seq, dim] residual stream (f32) */
+    uint16_t *norm;       /* [seq, dim] modulated LayerNorm (bf16) */
+    uint16_t *qkv;        /* [seq, 3*dim] */
+    uint16_t *gate;       /* [seq, mlp_dim] */
+    uint16_t *ffn;        /* [seq, mlp_dim] */
+    uint16_t *att;        /* [seq, dim] attention output */
+    uint16_t *cat;        /* [seq, dim] (unused, kept simple) */
+    float *o1, *o2;       /* [seq, dim] attention/FFN projection scratch (f32) */
+    float *rope_c, *rope_s;  /* [seq, head_dim/2] */
+    int *mask;            /* [seq] key validity */
+    float *vec;           /* modulation temb/mod/scale rows (f32) */
+    uint16_t *vec_b16;
+    /* model input staging */
+    size_t in_elems;
+    float *in_f32;
+    uint16_t *in_b16;
+};
+
+static void qw_dev_free(qw_transformer_t *tf) {
+    struct qw_dev *d = tf->dev;
+    if (!d) return;
+    if (d->blocks) {
+        for (int l = 0; l < tf->n_layers; l++) {
+            qw_dev_block_t *b = &d->blocks[l];
+            iris_dev_free(b->to_q); iris_dev_free(b->to_k);
+            iris_dev_free(b->to_v); iris_dev_free(b->to_out);
+            iris_dev_free(b->mlp_gate); iris_dev_free(b->mlp_proj); iris_dev_free(b->mlp_out);
+            iris_dev_free(b->norm_q); iris_dev_free(b->norm_k);
+        }
+        free(d->blocks);
+    }
+    iris_dev_free(d->img_in); iris_dev_free(d->txt_in); iris_dev_free(d->txt_out);
+    iris_dev_free(d->time_lin1); iris_dev_free(d->time_lin2);
+    iris_dev_free(d->modulation); iris_dev_free(d->norm_out_lin); iris_dev_free(d->proj_out);
+    iris_dev_free(d->txt_norm_w);
+    iris_dev_free(d->x); iris_dev_free(d->norm); iris_dev_free(d->qkv);
+    iris_dev_free(d->gate); iris_dev_free(d->ffn); iris_dev_free(d->att); iris_dev_free(d->cat);
+    iris_dev_free(d->o1); iris_dev_free(d->o2);
+    iris_dev_free(d->rope_c); iris_dev_free(d->rope_s); iris_dev_free(d->mask);
+    iris_dev_free(d->vec); iris_dev_free(d->vec_b16);
+    iris_dev_free(d->in_f32); iris_dev_free(d->in_b16);
+    free(d);
+    tf->dev = NULL;
+}
+
+static uint16_t *dev_up_bf16(const uint16_t *src, size_t n) {
+    uint16_t *d = iris_dev_alloc(n * sizeof(uint16_t));
+    if (d) iris_dev_upload(d, src, n * sizeof(uint16_t));
+    return d;
+}
+static float *dev_up_f32(const float *src, size_t n) {
+    float *d = iris_dev_alloc(n * sizeof(float));
+    if (d) iris_dev_upload(d, src, n * sizeof(float));
+    return d;
+}
+
+static int qw_dev_load(qw_transformer_t *tf) {
+    if (!iris_dev_available()) return 0;
+    struct qw_dev *d = calloc(1, sizeof(*d));
+    if (!d) return 0;
+    tf->dev = d;
+    int dim = tf->dim, mlp = tf->mlp_dim, hd = tf->head_dim, nl = tf->n_layers;
+    size_t ok = 1;
+
+    d->img_in = dev_up_bf16(tf->img_in, (size_t)dim * tf->in_ch);
+    d->txt_in = dev_up_bf16(tf->txt_in, (size_t)dim * tf->ctx_dim);
+    d->txt_out = dev_up_bf16(tf->txt_out, (size_t)dim * dim);
+    d->time_lin1 = dev_up_bf16(tf->time_lin1, (size_t)dim * 256);
+    d->time_lin2 = dev_up_bf16(tf->time_lin2, (size_t)dim * dim);
+    d->modulation = dev_up_bf16(tf->modulation, (size_t)4 * dim * dim);
+    d->norm_out_lin = dev_up_bf16(tf->norm_out_lin, (size_t)dim * dim);
+    d->proj_out = dev_up_bf16(tf->proj_out, (size_t)tf->in_ch * dim);
+    d->txt_norm_w = dev_up_f32(tf->txt_norm_w, tf->ctx_dim);
+    ok &= d->img_in && d->txt_in && d->txt_out && d->time_lin1 && d->time_lin2 &&
+          d->modulation && d->norm_out_lin && d->proj_out && d->txt_norm_w;
+
+    d->blocks = ok ? calloc(nl, sizeof(qw_dev_block_t)) : NULL;
+    ok &= d->blocks != NULL;
+    for (int l = 0; ok && l < nl; l++) {
+        qw_dev_block_t *b = &d->blocks[l];
+        b->to_q = dev_up_bf16(tf->to_q[l], (size_t)dim * dim);
+        b->to_k = dev_up_bf16(tf->to_k[l], (size_t)dim * dim);
+        b->to_v = dev_up_bf16(tf->to_v[l], (size_t)dim * dim);
+        b->to_out = dev_up_bf16(tf->to_out[l], (size_t)dim * dim);
+        b->mlp_gate = dev_up_bf16(tf->mlp_gate[l], (size_t)mlp * dim);
+        b->mlp_proj = dev_up_bf16(tf->mlp_proj[l], (size_t)mlp * dim);
+        b->mlp_out = dev_up_bf16(tf->mlp_out[l], (size_t)dim * mlp);
+        b->norm_q = dev_up_f32(tf->norm_q[l], hd);
+        b->norm_k = dev_up_f32(tf->norm_k[l], hd);
+        ok &= b->to_q && b->to_k && b->to_v && b->to_out && b->mlp_gate &&
+              b->mlp_proj && b->mlp_out && b->norm_q && b->norm_k;
+    }
+
+    /* Modulation-row scratch: one vector holding tembT/temb0, sinusoid inputs,
+     * hidden, silu(temb) (bf16), modulation, output scale, and tanh'd gates. */
+    d->o_sin = 0;              /* sinT, sin0            [256 each] */
+    d->o_h1  = d->o_sin + 256; /* h1T, h10             [dim each]  */
+    d->o_act = d->o_h1 + 2 * dim;   /* actT, act0       [dim each]  */
+    d->o_temb = d->o_act + 2 * dim; /* tembT, temb0     [dim each]  */
+    d->o_mod  = d->o_temb + 2 * dim;/* modT, mod0       [4dim each] */
+    d->o_sout = d->o_mod + 8 * dim; /* soutT, sout0     [dim each]  */
+    d->o_tg   = d->o_sout + 2 * dim;/* g1T,g2T,g10,g20  [dim each]  */
+    d->vecN   = d->o_tg + 4 * dim;
+    d->vec = ok ? iris_dev_alloc((size_t)d->vecN * sizeof(float)) : NULL;
+    d->vec_b16 = ok ? iris_dev_alloc((size_t)d->vecN * sizeof(uint16_t)) : NULL;
+    ok &= d->vec && d->vec_b16;
+
+    if (!ok) {
+        fprintf(stderr, "Qwen-Image 2.1: not enough GPU memory, using the CPU\n");
+        qw_dev_free(tf);
+        return 0;
+    }
+    iris_dev_sync();
+    return 1;
+}
+
+static int qw_dev_ensure(qw_transformer_t *tf, int seq, size_t in_elems) {
+    struct qw_dev *d = tf->dev;
+    int dim = tf->dim, mlp = tf->mlp_dim, hd = tf->head_dim;
+    if (seq > d->seq) {
+        iris_dev_free(d->x); iris_dev_free(d->norm); iris_dev_free(d->qkv);
+        iris_dev_free(d->gate); iris_dev_free(d->ffn); iris_dev_free(d->att);
+        iris_dev_free(d->o1); iris_dev_free(d->o2);
+        iris_dev_free(d->rope_c); iris_dev_free(d->rope_s); iris_dev_free(d->mask);
+        d->x   = iris_dev_alloc((size_t)seq * dim * sizeof(float));
+        d->norm= iris_dev_alloc((size_t)seq * dim * sizeof(uint16_t));
+        d->qkv = iris_dev_alloc((size_t)seq * 3 * dim * sizeof(uint16_t));
+        d->gate= iris_dev_alloc((size_t)seq * mlp * sizeof(uint16_t));
+        d->ffn = iris_dev_alloc((size_t)seq * mlp * sizeof(uint16_t));
+        d->att = iris_dev_alloc((size_t)seq * dim * sizeof(uint16_t));
+        d->o1  = iris_dev_alloc((size_t)seq * dim * sizeof(float));
+        d->o2  = iris_dev_alloc((size_t)seq * dim * sizeof(float));
+        d->rope_c = iris_dev_alloc((size_t)seq * hd / 2 * sizeof(float));
+        d->rope_s = iris_dev_alloc((size_t)seq * hd / 2 * sizeof(float));
+        d->mask = iris_dev_alloc((size_t)seq * sizeof(int));
+        if (!d->x || !d->norm || !d->qkv || !d->gate || !d->ffn || !d->att ||
+            !d->o1 || !d->o2 || !d->rope_c || !d->rope_s || !d->mask) return 0;
+        d->seq = seq;
+    }
+    if (in_elems > d->in_elems) {
+        iris_dev_free(d->in_f32); iris_dev_free(d->in_b16);
+        d->in_f32 = iris_dev_alloc(in_elems * sizeof(float));
+        d->in_b16 = iris_dev_alloc(in_elems * sizeof(uint16_t));
+        d->in_elems = (d->in_f32 && d->in_b16) ? in_elems : 0;
+        if (!d->in_elems) return 0;
+    }
+    return 1;
+}
+
+/* Metal's iris_dev_attention is non-causal only. The text segment (<= 512
+ * tokens, and small relative to the image) runs causal attention on the host
+ * by downloading its q/k/v rows, so the whole image block stays on-device. */
+static void qw_text_attn_host(qw_transformer_t *tf, const uint16_t *dq,
+                              const uint16_t *dk, const uint16_t *dv,
+                              int s_txt, const int *kv, float *dattn) {
+    int heads = tf->heads, hd = tf->head_dim, ldi = 3 * tf->dim;
+    int sz = s_txt * ldi;
+    float *q = malloc((size_t)sz * sizeof(float));
+    float *k = malloc((size_t)sz * sizeof(float));
+    float *v = malloc((size_t)sz * sizeof(float));
+    float *hout = malloc((size_t)s_txt * tf->dim * sizeof(float));
+    iris_dev_download(q, dq, (size_t)sz * 2);
+    iris_dev_download(k, dk, (size_t)sz * 2);
+    iris_dev_download(v, dv, (size_t)sz * 2);
+    for (int i = 0; i < sz; i++) {
+        uint32_t u = (uint32_t)q[i] << 16; float f; memcpy(&f, &u, 4); q[i] = f;
+        u = (uint32_t)k[i] << 16; memcpy(&f, &u, 4); k[i] = f;
+        u = (uint32_t)v[i] << 16; memcpy(&f, &u, 4); v[i] = f;
+    }
+    qw_seg_attn(q, k, v, heads, hd, 0, s_txt, s_txt, 1, kv, hout);
+    iris_dev_upload(dattn, hout, (size_t)s_txt * tf->dim * sizeof(float));
+    free(q); free(k); free(v); free(hout);
+}
+
+static int qw_forward_dev(qw_transformer_t *tf, const float *z, const float *txt,
+                          const int *txt_mask, int s_txt, int img_h, int img_w,
+                          float sigma, float *v) {
+    struct qw_dev *d = tf->dev;
+    int dim = tf->dim, heads = tf->heads, hd = tf->head_dim, half = hd / 2;
+    int mlp = tf->mlp_dim, n_img = img_h * img_w, N = s_txt + n_img;
+    float t = 1000.0f * sigma;
+
+    size_t in_elems = (size_t)s_txt * tf->ctx_dim;
+    if ((size_t)n_img * tf->in_ch > in_elems) in_elems = (size_t)n_img * tf->in_ch;
+    if ((size_t)(s_txt > 0 ? s_txt : n_img) * dim > in_elems)
+        in_elems = (size_t)(s_txt > 0 ? s_txt : n_img) * dim;
+    if (!qw_dev_ensure(tf, N, in_elems)) {
+        fprintf(stderr, "Qwen-Image 2.1: GPU allocation failed for %d tokens\n", N);
+        return 0;
+    }
+    if (getenv("QW_DBG")) fprintf(stderr, "[qd] ensure ok N=%d\n", N);
+
+    /* Text projection on the host (only a few dozen tokens; needs the
+     * zero-centered RMSNorm and GELU that the device API lacks). Result rows
+     * are uploaded to x. */
+    if (s_txt > 0) {
+        float *enc = malloc((size_t)s_txt * tf->ctx_dim * sizeof(float));
+        memcpy(enc, txt, (size_t)s_txt * tf->ctx_dim * sizeof(float));
+        qw_rmsnorm(enc, s_txt, tf->ctx_dim, tf->txt_norm_w, 1, tf->eps);
+        /* Every graph input/output must be an iris_dev_alloc'd buffer (the
+         * Metal backend maps pointers back to MTLBuffers); host round-trips
+         * (for GELU) go through download/upload, never a malloc'd buffer. */
+        iris_dev_upload(d->in_f32, enc, (size_t)s_txt * tf->ctx_dim * sizeof(float));
+        iris_dev_f32_to_bf16(d->in_b16, d->in_f32, (size_t)s_txt * tf->ctx_dim);
+        iris_dev_linear_f32(d->o1, d->in_b16, d->txt_in, s_txt, tf->ctx_dim, dim);
+        float *pin = malloc((size_t)s_txt * dim * sizeof(float));
+        iris_dev_download(pin, d->o1, (size_t)s_txt * dim * sizeof(float));
+        qw_gelu_tanh(pin, s_txt * dim);
+        iris_dev_upload(d->in_f32, pin, (size_t)s_txt * dim * sizeof(float));
+        iris_dev_f32_to_bf16(d->in_b16, d->in_f32, (size_t)s_txt * dim);
+        free(pin); free(enc);
+        iris_dev_linear_f32(d->x, d->in_b16, d->txt_out, s_txt, dim, dim);
+    }
+
+    /* Image latents -> x[s_txt:]. */
+    if (getenv("QW_DBG")) fprintf(stderr, "[qd] after text proj\n");
+    iris_dev_upload(d->in_f32, z, (size_t)n_img * tf->in_ch * sizeof(float));
+    iris_dev_f32_to_bf16(d->in_b16, d->in_f32, (size_t)n_img * tf->in_ch);
+    iris_dev_linear_f32(d->x + (size_t)s_txt * dim, d->in_b16, d->img_in,
+                        n_img, tf->in_ch, dim);
+
+    /* Timestep embeddings for sigma and t = 0. */
+    float embT[256], emb0[256];
+    qw_time_embed(embT, t);
+    for (int j = 0; j < 128; j++) { emb0[j] = 1.0f; emb0[128 + j] = 0.0f; }
+    iris_dev_upload(d->vec + d->o_sin, embT, 256 * sizeof(float));
+    iris_dev_upload(d->vec + d->o_sin + 256, emb0, 256 * sizeof(float));
+    iris_dev_f32_to_bf16(d->vec_b16 + d->o_sin, d->vec + d->o_sin, 256);
+    iris_dev_f32_to_bf16(d->vec_b16 + d->o_sin + 256, d->vec + d->o_sin + 256, 256);
+    float *h1T = d->vec + d->o_h1, *h10 = h1T + dim;
+    iris_dev_linear_f32(h1T, d->vec_b16 + d->o_sin, d->time_lin1, 1, 256, dim);
+    iris_dev_silu(h1T, dim);
+    iris_dev_f32_to_bf16(d->vec_b16 + d->o_h1, h1T, dim);
+    float *tembT = d->vec + d->o_temb, *temb0 = tembT + dim;
+    iris_dev_linear_f32(tembT, d->vec_b16 + d->o_h1, d->time_lin2, 1, dim, dim);
+    iris_dev_linear_f32(h10, d->vec_b16 + d->o_sin + 256, d->time_lin1, 1, 256, dim);
+    iris_dev_silu(h10, dim);
+    iris_dev_f32_to_bf16(d->vec_b16 + d->o_h1 + dim, h10, dim);
+    iris_dev_linear_f32(temb0, d->vec_b16 + d->o_h1 + dim, d->time_lin2, 1, dim, dim);
+
+    /* Modulation rows (shared across all blocks) and output scales. */
+    iris_dev_f32_to_bf16(d->vec_b16 + d->o_act, tembT, dim);
+    iris_dev_f32_to_bf16(d->vec_b16 + d->o_act + dim, temb0, dim);
+    float *modT = d->vec + d->o_mod, *mod0 = modT + 4 * dim;
+    iris_dev_linear_f32(modT, d->vec_b16 + d->o_act, d->modulation, 1, dim, 4 * dim);
+    iris_dev_linear_f32(mod0, d->vec_b16 + d->o_act + dim, d->modulation, 1, dim, 4 * dim);
+    iris_dev_linear_f32(d->vec + d->o_sout, d->vec_b16 + d->o_act, d->norm_out_lin, 1, dim, dim);
+    iris_dev_linear_f32(d->vec + d->o_sout + dim, d->vec_b16 + d->o_act + dim, d->norm_out_lin, 1, dim, dim);
+
+    /* tanh of the gate rows (iris_dev_residual has no tanh): the device API
+     * lacks tanh, so download the two modulation rows, tanh their gate parts
+     * on the host, and upload the four gate vectors. */
+    {
+        static const float zero[4] = {0,0,0,0};
+        iris_dev_upload(d->vec + d->o_tg,        zero, 0);
+        iris_dev_download(modT, modT, 4 * dim * sizeof(float));
+        iris_dev_download(mod0, mod0, 4 * dim * sizeof(float));
+        float *g1T = d->vec + d->o_tg, *g2T = g1T + dim, *g10 = g2T + dim, *g20 = g10 + dim;
+        for (int j = 0; j < dim; j++) { g1T[j] = tanhf(modT[dim + j]);     g2T[j] = tanhf(modT[3 * dim + j]); }
+        for (int j = 0; j < dim; j++) { g10[j] = tanhf(mod0[dim + j]);     g20[j] = tanhf(mod0[3 * dim + j]); }
+    }
+
+    /* RoPE cos/sin (device layout: [seq, head_dim/2], consecutive pairs). */
+    float *qk_c = malloc((size_t)N * hd * sizeof(float));
+    float *qk_s = malloc((size_t)N * hd * sizeof(float));
+    int *kv = malloc(N * sizeof(int));
+    for (int i = 0; i < s_txt; i++) {
+        kv[i] = txt_mask ? txt_mask[i] : 1;
+        qw_token_rope(tf, i, i, i, qk_c + (size_t)i * hd, qk_s + (size_t)i * hd);
+    }
+    int hh = img_h - img_h / 2, ww = img_w - img_w / 2;
+    for (int r = 0; r < img_h; r++)
+        for (int c = 0; c < img_w; c++) {
+            int i = s_txt + r * img_w + c;
+            kv[i] = 1;
+            qw_token_rope(tf, s_txt, r - hh, c - ww, qk_c + (size_t)i * hd, qk_s + (size_t)i * hd);
+        }
+    {
+        float *rc = malloc((size_t)N * half * sizeof(float));
+        float *rs = malloc((size_t)N * half * sizeof(float));
+        for (int i = 0; i < N; i++)
+            for (int p = 0; p < half; p++) {
+                rc[(size_t)i * half + p] = qk_c[(size_t)i * hd + 2 * p];
+                rs[(size_t)i * half + p] = qk_s[(size_t)i * hd + 2 * p];
+            }
+        iris_dev_upload(d->rope_c, rc, (size_t)N * half * sizeof(float));
+        iris_dev_upload(d->rope_s, rs, (size_t)N * half * sizeof(float));
+        free(rc); free(rs);
+    }
+    iris_dev_upload(d->mask, kv, (size_t)N * sizeof(int));
+    int *kv_host = kv;   /* kept: host text attention needs the validity flags */
+    free(qk_c); free(qk_s);
+
+    float scale = 1.0f / sqrtf((float)hd);
+    /* Blocks. */
+    if (getenv("QW_DBG")) fprintf(stderr, "[qd] before blocks\n");
+    for (int b = 0; b < tf->n_layers; b++) {
+        qw_dev_block_t *bl = &d->blocks[b];
+        if (getenv("QW_DBG") && b < 2) fprintf(stderr, "[qd] block %d\n", b);
+        for (int seg = 0; seg < 2; seg++) {
+            int start = seg ? s_txt : 0, len = seg ? n_img : s_txt;
+            if (len <= 0) continue;
+            const float *m = seg ? modT : mod0;
+            iris_dev_layer_norm_mod(d->norm + (size_t)start * dim, d->x + (size_t)start * dim,
+                                    m, m + dim, len, dim, tf->eps);
+        }
+        iris_dev_linear_bf16(d->qkv, d->norm, bl->to_q, N, dim, dim);
+        iris_dev_linear_bf16(d->qkv + dim, d->norm, bl->to_k, N, dim, dim);
+        iris_dev_linear_bf16(d->qkv + 2 * dim, d->norm, bl->to_v, N, dim, dim);
+        iris_dev_head_norm_rope(d->qkv, 3 * dim, bl->norm_q, d->rope_c, d->rope_s, N, heads, hd, tf->eps, 0);
+        iris_dev_head_norm_rope(d->qkv + dim, 3 * dim, bl->norm_k, d->rope_c, d->rope_s, N, heads, hd, tf->eps, 0);
+        if (s_txt > 0)
+            qw_text_attn_host(tf, d->qkv, d->qkv + dim, d->qkv + 2 * dim, s_txt, kv_host, d->att);
+        iris_dev_attention(d->att + (size_t)s_txt * dim, dim, d->qkv + (size_t)s_txt * dim,
+                           d->qkv + dim, d->qkv + 2 * dim, 3 * dim,
+                           n_img, N, heads, heads, hd, scale, 0, d->mask);
+        iris_dev_linear_bf16(d->gate, d->norm, bl->mlp_gate, N, dim, mlp);
+        iris_dev_linear_bf16(d->ffn, d->norm, bl->mlp_proj, N, dim, mlp);
+        iris_dev_swiglu(d->ffn, mlp, d->gate, d->ffn, mlp, N, mlp);
+        iris_dev_linear_f32(d->o1, d->att, bl->to_out, N, dim, dim);
+        iris_dev_linear_f32(d->o2, d->ffn, bl->mlp_out, N, mlp, dim);
+        for (int seg = 0; seg < 2; seg++) {
+            int start = seg ? s_txt : 0, len = seg ? n_img : s_txt;
+            if (len <= 0) continue;
+            float *o = d->o1 + (size_t)start * dim, *o2 = d->o2 + (size_t)start * dim;
+            for (size_t e = 0; e < (size_t)len * dim; e++) o[e] += o2[e];
+            iris_dev_residual(d->x + (size_t)start * dim, o, d->vec + d->o_tg + (seg ? 2 * dim : 0), len, dim);
+        }
+        iris_dev_sync();
+    }
+
+    /* norm_out: LN (no shift/scale) then * (1 + scale_row), then proj_out on
+     * the image rows. The device API has no per-row bf16 scale, so scale in a
+     * host f32 round-trip and re-stash as bf16 in a scratch buffer. */
+    iris_dev_layer_norm_mod(d->norm, d->x, NULL, NULL, N, dim, tf->eps);
+    {
+        float *nf = d->o1;   /* device f32 scratch (>= n_img*dim) */
+        iris_dev_download(nf, d->norm + (size_t)s_txt * dim, (size_t)n_img * dim * sizeof(uint16_t));
+        for (size_t i = 0; i < (size_t)n_img * dim; i++) {
+            uint32_t u = (uint32_t)nf[i] << 16; float f; memcpy(&f, &u, 4); nf[i] = f;
+        }
+        const float *sc = d->vec + d->o_sout;   /* image row -> soutT */
+        for (size_t i = 0; i < (size_t)n_img * dim; i++) nf[i] *= 1.0f + sc[i % dim];
+        /* Re-upload as bf16 into the att buffer (>= n_img*dim) and project. */
+        iris_dev_upload(d->in_f32, nf, (size_t)n_img * dim * sizeof(float));
+        iris_dev_f32_to_bf16(d->att, d->in_f32, (size_t)n_img * dim);
+        iris_dev_linear_f32(d->o1, d->att, d->proj_out, n_img, dim, tf->in_ch);
+    if (getenv("QW_DBG")) fprintf(stderr, "[qd] after norm_out\n");
+    }
+    iris_dev_sync();
+    iris_dev_download(v, d->o1, (size_t)n_img * tf->in_ch * sizeof(float));
+    return 1;
+}
+#endif /* IRIS_DEV */
+
 void qw_transformer_forward(qw_transformer_t *tf,
                             const float *z, const float *txt,
                             const int *txt_mask, int s_txt,
                             int img_h, int img_w,
                             float sigma, float *v)
 {
-    int dim = tf->dim, heads = tf->heads, hd = tf->head_dim;
+#ifdef IRIS_DEV
+    if (tf->dev) {
+        if (qw_forward_dev(tf, z, txt, txt_mask, s_txt, img_h, img_w, sigma, v))
+            return;
+        /* device forward failed: fall back to the CPU path */
+    }
+#endif
+    int dim = tf->dim, hd = tf->head_dim;
     int n_img = img_h * img_w;
     int N = s_txt + n_img;
     float t = 1000.0f * sigma;
