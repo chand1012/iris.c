@@ -35,6 +35,7 @@ transformer recomputes the full sequence every step in the first phase).
 """
 
 import argparse
+import gc
 import json
 import os
 import sys
@@ -129,6 +130,12 @@ def main():
         state["embeds"] = out[0]
         state["enc_mask"] = out[1]
         state["img_mask"] = out[2]
+        # Free the text encoder once its embeddings are captured: the denoise
+        # loop needs only the transformer + VAE, and a float32 1024-sq run
+        # otherwise blows past host RAM with encoder + transformer resident.
+        if getattr(pipe, "text_encoder", None) is not None:
+            pipe.text_encoder = None
+            gc.collect()
         return out
     pipe.encode_prompt = hook_encode_prompt
 
@@ -164,6 +171,22 @@ def main():
         return out
     state["noise_preds"] = []
     pipe.transformer.forward = types.MethodType(hook_transformer, pipe.transformer)
+
+    # --- vision tower: pixel_values, grid_thw, merged + deepstack embeds ----
+    # Fires only for image-conditioned runs (pixel_values present). Gives the
+    # C vision-tower implementation its per-stage parity targets.
+    vis = getattr(getattr(pipe.text_encoder, "model", None), "visual", None)
+    if vis is not None:
+        orig_vis = vis.forward
+
+        def hook_vis(self, hidden_states, grid_thw, *a, **kw):
+            out = orig_vis(hidden_states, grid_thw, *a, **kw)
+            state["vis_pixel_values"] = hidden_states
+            state["vis_grid_thw"] = grid_thw
+            state["vis_merged"] = out.pooler_output
+            state["vis_deepstack"] = out.deepstack_features
+            return out
+        vis.forward = types.MethodType(hook_vis, vis)
 
     step_latents = []
 
@@ -232,6 +255,13 @@ def main():
             n = s[1] * s[2]
             dump_bin(a.out, f"ref{i}.bin", refs[start:start + n])
             start += n
+    if state.get("vis_pixel_values") is not None:
+        dump_bin(a.out, "vis_pixel_values.bin", state["vis_pixel_values"])
+        write_text(a.out, "vis_grid_thw.txt",
+                   " ".join(str(int(x)) for x in state["vis_grid_thw"].flatten().tolist()) + "\n")
+        dump_bin(a.out, "vis_merged.bin", state["vis_merged"])
+        for i, df in enumerate(state["vis_deepstack"]):
+            dump_bin(a.out, f"vis_deepstack{i}.bin", df)
     dump_bin(a.out, "noise.bin", state["latents0"][0])
     write_text(a.out, "sigmas.txt",
                "".join(f"{s:.9f}\n" for s in state["sigmas"].tolist()))
