@@ -171,6 +171,9 @@ test:
 test-quick:
 	@python3 run_test.py --flux-binary ./$(TARGET) --quick
 
+test-qwen21:
+	@sh debug/test_qw21.sh
+
 pngtest:
 	@echo "Running PNG compression compare test..."
 	@$(CC) $(CFLAGS_BASE) -I. png_compare.c iris_image.c -lm -o /tmp/iris_png_compare
