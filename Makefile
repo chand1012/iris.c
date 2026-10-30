@@ -108,7 +108,7 @@ iris_cuda.o: iris_cuda.cu iris_dev.h
 # =============================================================================
 ifeq ($(UNAME_S),Darwin)
 ifeq ($(UNAME_M),arm64)
-MPS_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_METAL -DIRIS_DEV -DACCELERATE_NEW_LAPACK -DIRIS_USE_ACCELERATE
+MPS_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_METAL -DIRIS_DEV -DQW_ENABLE_METAL -DACCELERATE_NEW_LAPACK -DIRIS_USE_ACCELERATE
 MPS_OBJCFLAGS = $(MPS_CFLAGS) -fobjc-arc
 MPS_LDFLAGS = $(LDFLAGS) -framework Accelerate -framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph -framework Foundation
 

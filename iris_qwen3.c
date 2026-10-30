@@ -1181,8 +1181,12 @@ static float *qwen3_forward_mi(qwen3_model_t *model, const int *input_ids,
          * hidden_state is unmodified (GPU worked on a copy). */
     }
 
-    /* Start batch mode to reduce GPU sync overhead between layers */
-    int batch_mode = model->use_bf16 && iris_metal_available();
+    /* Start batch mode to reduce GPU sync overhead between layers.
+     * Image-conditioned forwards (img_rows) stay on the CPU BLAS path: the
+     * legacy GPU layer path streams bf16-only weights and does not support
+     * the vision inject / deepstack host writes (it crashes). */
+    int gpu_layers = model->use_bf16 && iris_metal_available() && !img_rows;
+    int batch_mode = gpu_layers;
     if (batch_mode) {
         iris_gpu_batch_begin();
     }
@@ -1192,7 +1196,7 @@ static float *qwen3_forward_mi(qwen3_model_t *model, const int *input_ids,
         /* In mmap mode, load layer weights on-demand */
         if (model->use_mmap) {
 #ifdef USE_METAL
-            if (model->use_bf16) {
+            if (gpu_layers) {
                 /* Load only small f32 weights (layer norms) + bf16 projection weights */
                 if (load_layer_weights_small_f32(&model->layers[layer_idx], model->sf_files, model->num_sf_files, model->prefix, layer_idx) != 0) {
                     fprintf(stderr, "Failed to load layer %d small weights\n", layer_idx);
@@ -1213,7 +1217,7 @@ static float *qwen3_forward_mi(qwen3_model_t *model, const int *input_ids,
         }
 
 #ifdef USE_METAL
-        if (model->use_bf16 && iris_metal_available()) {
+        if (gpu_layers) {
             qwen3_layer_forward_bf16(model, &model->layers[layer_idx], seq_len, attention_mask);
         } else
 #endif

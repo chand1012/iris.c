@@ -89,6 +89,8 @@ def parse_args():
     p.add_argument("--noise", default=None, help="start from this packed noise file")
     p.add_argument("--kv-cache", action="store_true",
                    help="enable the pipeline's prefix KV cache")
+    p.add_argument("--tf-bf16", action="store_true",
+                   help="run the transformer in bfloat16 (production dtype)")
     p.add_argument("-o", "--out",
                    default=os.path.join(tempfile.gettempdir(), "qwen21_ref"))
     return p.parse_args()
@@ -107,6 +109,10 @@ def main():
             a.dir, torch_dtype=torch.float32, device_map="cpu")
     except Exception as e:
         sys.exit(f"failed to load {a.dir}: {e}")
+
+    if a.tf_bf16:
+        pipe.transformer = pipe.transformer.to(torch.bfloat16)
+        print("transformer cast to bfloat16")
 
     state = {}
 
@@ -154,9 +160,17 @@ def main():
     orig_forward = pipe.transformer.forward
 
     def hook_transformer(self, *args, **kwargs):
+        if a.tf_bf16:
+            dt = next(self.parameters()).dtype
+            args = tuple(t.to(dt) if torch.is_tensor(t) and t.is_floating_point() else t
+                         for t in args)
+            kwargs = {k: (t.to(dt) if torch.is_tensor(t) and t.is_floating_point() else t)
+                      for k, t in kwargs.items()}
         out = orig_forward(*args, **kwargs)  # orig_forward bound to the module
         if not isinstance(out, tuple) or out[0] is None:
             return out
+        if a.tf_bf16:
+            out = (out[0].float(),) + tuple(out[1:])
         state["img_shapes"] = kwargs.get("img_shapes")
         state["img_mask_full"] = kwargs.get("img_mask")
         # Keep the same target-only slice the pipeline keeps: with

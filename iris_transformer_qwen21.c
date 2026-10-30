@@ -112,7 +112,8 @@ static int  qw_forward_dev(qw_transformer_t *tf, const float *z, const float *tx
                            float sigma, float *v);
 static void qw_dev_free(qw_transformer_t *tf);
 static void qw_attn_host(qw_transformer_t *tf, const uint16_t *dq, const uint16_t *dk,
-                         const uint16_t *dv, int s_txt, int n_img, const int *kv, float *dattn);
+                         const uint16_t *dv, int s_txt, int n_img, const int *kv,
+                         uint16_t *dattn);
 #endif
 
 /* ========================================================================
@@ -441,21 +442,11 @@ static void qw_rope_apply(float *x, int n_tok, int heads, int hd,
         const float *ts = s + (size_t)i * hd;
         for (int h = 0; h < heads; h++) {
             float *row = x + ((size_t)i * heads + h) * hd;
-#ifdef QW_ROPE_DEBUG
-            if (i == 1 && h == 0 && n_tok > 1) {
-                fprintf(stderr, "  rope_apply: n_tok=%d tc[0]=%.6g ts[0]=%.6g row[0] %.6g -> ",
-                        n_tok, tc[0], ts[0], row[0]);
-            }
-#endif
             for (int p = 0; p < hd; p += 2) {
                 float a = row[p], b = row[p + 1];
                 row[p] = a * tc[p] - b * ts[p];
                 row[p + 1] = a * ts[p] + b * tc[p];
             }
-#ifdef QW_ROPE_DEBUG
-            if (i == 1 && h == 0 && n_tok > 1)
-                fprintf(stderr, "%.6g\n", row[0]);
-#endif
         }
     }
 }
@@ -618,7 +609,6 @@ static void qw_block(qw_transformer_t *tf, int b, float *x, float *xm,
                   qk_c + (size_t)r0 * hd, qk_s + (size_t)r0 * hd);
     qw_rope_apply(kk + (size_t)r0 * dim, n, heads, hd,
                   qk_c + (size_t)r0 * hd, qk_s + (size_t)r0 * hd);
-
     if (sk && np > 0) {          /* fill (mode 1): prefix rows are all fresh */
         memcpy(sk, kk, (size_t)np * dim * sizeof(float));
         memcpy(sv, vv, (size_t)np * dim * sizeof(float));
@@ -632,7 +622,6 @@ static void qw_block(qw_transformer_t *tf, int b, float *x, float *xm,
     float *attnout = malloc((size_t)n_tok * dim * sizeof(float));
     qw_seg_attn(q, kk, vv, heads, hd, r0, n_tok, n_tok, block_id, key_valid, attnout);
     free(q); free(kk); free(vv);
-
     float *a = malloc((size_t)n * dim * sizeof(float));
     qw_gemm(attnout + (size_t)r0 * dim, tf->to_out[b], a, n, dim, dim);
     free(attnout);
@@ -808,7 +797,7 @@ static int qw_dev_load(qw_transformer_t *tf) {
     /* Modulation-row scratch: one vector holding tembT/temb0, sinusoid inputs,
      * hidden, silu(temb) (bf16), modulation, output scale, and tanh'd gates. */
     d->o_sin = 0;              /* sinT, sin0            [256 each] */
-    d->o_h1  = d->o_sin + 256; /* h1T, h10             [dim each]  */
+    d->o_h1  = d->o_sin + 512; /* h1T, h10             [dim each]  */
     d->o_act = d->o_h1 + 2 * dim;   /* actT, act0       [dim each]  */
     d->o_temb = d->o_act + 2 * dim; /* tembT, temb0     [dim each]  */
     d->o_mod  = d->o_temb + 2 * dim;/* modT, mod0       [4dim each] */
@@ -875,7 +864,8 @@ static int qw_dev_ensure(qw_transformer_t *tf, int seq, size_t in_elems) {
  * linear_f32, which expects a bf16 operand). The large image segment runs
  * on-device via iris_dev_attention. */
 static void qw_attn_host(qw_transformer_t *tf, const uint16_t *dq, const uint16_t *dk,
-                         const uint16_t *dv, int s_txt, int n_img, const int *kv, float *dattn) {
+                         const uint16_t *dv, int s_txt, int n_img, const int *kv,
+                         uint16_t *dattn) {
     (void)n_img;
     if (s_txt <= 0) return;
     int heads = tf->heads, hd = tf->head_dim, dim = tf->dim;
@@ -1065,13 +1055,9 @@ static int qw_forward_dev(qw_transformer_t *tf, const float *z, const float *txt
             iris_dev_residual(d->x + (size_t)start * dim, d->o1 + (size_t)start * dim,
                               d->vec + d->o_tg + go, len, dim);
         }
-        iris_dev_linear_bf16(d->gate, d->cat, bl->mlp_gate, N, dim, mlp);
-        iris_dev_linear_bf16(d->ffn, d->cat, bl->mlp_proj, N, dim, mlp);
-        iris_dev_swiglu(d->ffn, mlp, d->gate, d->ffn, mlp, N, mlp);
-        iris_dev_linear_f32(d->o2, d->ffn, bl->mlp_out, N, mlp, dim);
-        /* Second gated residual, on the norm2 stream: LN(x)*(1+scale2), with x
-         * the *updated* residual stream (after residual1), per the reference
-         * block (img_norm2 + tanh(gate2) * mlp). mod2 = modulation[2*dim:]. */
+        /* norm2 stream: LN(x)*(1+scale2) on the *updated* residual stream
+         * (after residual1), per the reference block. Must run before the
+         * FFN GEMMs, which consume d->cat. */
         for (int seg = 0; seg < 2; seg++) {
             int start = seg ? s_txt : 0, len = seg ? n_img : s_txt;
             if (len <= 0) continue;
@@ -1079,6 +1065,10 @@ static int qw_forward_dev(qw_transformer_t *tf, const float *z, const float *txt
             iris_dev_layer_norm_mod(d->cat + (size_t)start * dim, d->x + (size_t)start * dim,
                                     NULL, m + 2 * dim, len, dim, tf->eps);
         }
+        iris_dev_linear_bf16(d->gate, d->cat, bl->mlp_gate, N, dim, mlp);
+        iris_dev_linear_bf16(d->ffn, d->cat, bl->mlp_proj, N, dim, mlp);
+        iris_dev_swiglu(d->ffn, mlp, d->gate, d->ffn, mlp, N, mlp);
+        iris_dev_linear_f32(d->o2, d->ffn, bl->mlp_out, N, mlp, dim);
         for (int seg = 0; seg < 2; seg++) {
             int start = seg ? s_txt : 0, len = seg ? n_img : s_txt;
             if (len <= 0) continue;
@@ -1086,7 +1076,6 @@ static int qw_forward_dev(qw_transformer_t *tf, const float *z, const float *txt
             iris_dev_residual(d->x + (size_t)start * dim, d->o2 + (size_t)start * dim,
                               d->vec + d->o_tg + go + dim, len, dim);
         }
-        iris_dev_sync();
     }
 
     /* norm_out: LayerNorm (no shift/scale) then * (1 + soutT), then proj_out
