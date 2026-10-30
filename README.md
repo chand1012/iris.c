@@ -70,6 +70,14 @@ For FLUX.3 Image Klein (gated, accept the license on HuggingFace first, ~20GB):
 ./iris -d flux-3-klein -p "a fish" -o fish.png
 ```
 
+For Qwen-Image 2.1 (text2img + reference-image editing, RGBA output, ~31GB):
+```bash
+./download_model.sh qwen-image-2.1
+# or: python download_model.py qwen-image-2.1
+./iris -d qwen-image-2.1 -p "a fish" -o fish.png
+./iris -d qwen-image-2.1 -p "make it night" -i photo.png -o night.png
+```
+
 That's it. No Python runtime required at inference time.
 
 ## Example Output
@@ -398,6 +406,7 @@ pip install huggingface_hub && python download_model.py zimage-turbo
 | Z-Image-Turbo | `./zimage-turbo` | ~12GB | VAE, Transformer (~6B), Qwen3-4B |
 | FLUX.3 distilled | `./flux-3-klein` | ~20GB | VAE (~300MB), Transformer (~11GB), Qwen3-VL-4B (~9GB) |
 | FLUX.3 base | `./flux-3-klein-base` | ~20GB | VAE (~300MB), Transformer (~11GB), Qwen3-VL-4B (~9GB) |
+| Qwen-Image 2.1 | `./qwen-image-2.1` | ~31GB | VAE (~1.3GB), Transformer (~13GB), Qwen3-VL-8B (~16GB) |
 
 ## How Fast Is It?
 
