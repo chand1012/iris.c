@@ -92,6 +92,12 @@ struct qw_transformer {
     safetensors_file_t **shards;
     int nshards;
 
+    /* Editing KV cache: per-layer prefix K/V rows (post QK-norm and RoPE),
+     * step-invariant because condition tokens modulate at t=0. Filled by a
+     * full pass, consumed by target-only passes. kvc_rows = prefix rows. */
+    float *kvc_k, *kvc_v;
+    int kvc_rows;
+
 #ifdef IRIS_DEV
     struct qw_dev *dev;   /* device (Metal) copy of the model; NULL = CPU path */
 #endif
@@ -374,6 +380,7 @@ void qw_transformer_free(qw_transformer_t *tf) {
      * closing the files releases them (do not free the pointers). Only the
      * small norm vectors are malloc'd f32 and are freed here. */
     free(tf->txt_norm_w);
+    free(tf->kvc_k); free(tf->kvc_v);
     for (int l = 0; l < tf->n_layers; l++) {
         free(tf->norm_q[l]); free(tf->norm_k[l]);
     }
@@ -572,81 +579,95 @@ static void qw_block(qw_transformer_t *tf, int b, float *x, float *xm,
                      int n_tok, const float *mT, const float *m0,
                      const int *is_target,
                      const float *qk_c, const float *qk_s,  /* per-token RoPE */
-                     const int *block_id, const int *key_valid)
+                     const int *block_id, const int *key_valid,
+                     int r0,           /* rows [r0, n_tok) are computed */
+                     int np,           /* prefix rows to save when sk != NULL */
+                     float *sk, float *sv,          /* cache fill (mode 1) */
+                     const float *ck, const float *cv) /* cache use (mode 2) */
 {
     int dim = tf->dim, heads = tf->heads, hd = tf->head_dim;
     int d4 = 4 * dim;
+    int n = n_tok - r0;              /* rows computed this call */
     const float *sc1T = mT, *g1T = mT + dim, *sc2T = mT + 2 * dim, *g2T = mT + 3 * dim;
     const float *sc10 = m0, *g10 = m0 + dim, *sc20 = m0 + 2 * dim, *g20 = m0 + 3 * dim;
 
     /* norm1 + modulate 1 */
-    memcpy(xm, x, (size_t)n_tok * dim * sizeof(float));
-    qw_layernorm(xm, n_tok, dim, tf->eps);
-    for (int i = 0; i < n_tok; i++) {
-        const float *sc = is_target[i] ? sc1T : sc10;
+    memcpy(xm, x + (size_t)r0 * dim, (size_t)n * dim * sizeof(float));
+    qw_layernorm(xm, n, dim, tf->eps);
+    for (int i = 0; i < n; i++) {
+        const float *sc = is_target[r0 + i] ? sc1T : sc10;
         float *row = xm + (size_t)i * dim;
         for (int j = 0; j < dim; j++) row[j] *= 1.0f + sc[j];
     }
     /* attention */
     float *q = malloc((size_t)n_tok * dim * sizeof(float));
-    float *k = malloc((size_t)n_tok * dim * sizeof(float));
+    float *kk = malloc((size_t)n_tok * dim * sizeof(float));
     float *vv = malloc((size_t)n_tok * dim * sizeof(float));
-    qw_gemm(xm, tf->to_q[b], q, n_tok, dim, dim);
-    qw_gemm(xm, tf->to_k[b], k, n_tok, dim, dim);
-    qw_gemm(xm, tf->to_v[b], vv, n_tok, dim, dim);
-    for (int i = 0; i < n_tok; i++) {
+    qw_gemm(xm, tf->to_q[b], q + (size_t)r0 * dim, n, dim, dim);
+    qw_gemm(xm, tf->to_k[b], kk + (size_t)r0 * dim, n, dim, dim);
+    qw_gemm(xm, tf->to_v[b], vv + (size_t)r0 * dim, n, dim, dim);
+    for (int i = 0; i < n; i++) {
         for (int h = 0; h < heads; h++) {
-            qw_rmsnorm(q + ((size_t)i * heads + h) * hd, 1, hd,
+            qw_rmsnorm(q + ((size_t)(r0 + i) * heads + h) * hd, 1, hd,
                        tf->norm_q[b], 0, tf->eps);
-            qw_rmsnorm(k + ((size_t)i * heads + h) * hd, 1, hd,
+            qw_rmsnorm(kk + ((size_t)(r0 + i) * heads + h) * hd, 1, hd,
                        tf->norm_k[b], 0, tf->eps);
         }
     }
-    qw_rope_apply(q, n_tok, heads, hd, qk_c, qk_s);
-    qw_rope_apply(k, n_tok, heads, hd, qk_c, qk_s);
+    qw_rope_apply(q + (size_t)r0 * dim, n, heads, hd,
+                  qk_c + (size_t)r0 * hd, qk_s + (size_t)r0 * hd);
+    qw_rope_apply(kk + (size_t)r0 * dim, n, heads, hd,
+                  qk_c + (size_t)r0 * hd, qk_s + (size_t)r0 * hd);
 
+    if (sk && np > 0) {          /* fill (mode 1): prefix rows are all fresh */
+        memcpy(sk, kk, (size_t)np * dim * sizeof(float));
+        memcpy(sv, vv, (size_t)np * dim * sizeof(float));
+    } else if (ck) {             /* use (mode 2): prefix rows come from cache */
+        memcpy(kk, ck, (size_t)r0 * dim * sizeof(float));
+        memcpy(vv, cv, (size_t)r0 * dim * sizeof(float));
+    }
 
     /* One block-causal pass over the whole joint sequence: text rows are
      * strictly causal, every image block is bidirectional inside itself. */
     float *attnout = malloc((size_t)n_tok * dim * sizeof(float));
-    qw_seg_attn(q, k, vv, heads, hd, 0, n_tok, n_tok, block_id, key_valid, attnout);
-    free(q); free(k); free(vv);
+    qw_seg_attn(q, kk, vv, heads, hd, r0, n_tok, n_tok, block_id, key_valid, attnout);
+    free(q); free(kk); free(vv);
 
-    float *a = malloc((size_t)n_tok * dim * sizeof(float));
-    qw_gemm(attnout, tf->to_out[b], a, n_tok, dim, dim);
+    float *a = malloc((size_t)n * dim * sizeof(float));
+    qw_gemm(attnout + (size_t)r0 * dim, tf->to_out[b], a, n, dim, dim);
     free(attnout);
 
     /* gated residual 1 */
-    for (int i = 0; i < n_tok; i++) {
-        const float *g = is_target[i] ? g1T : g10;
+    for (int i = 0; i < n; i++) {
+        const float *g = is_target[r0 + i] ? g1T : g10;
         const float *ar = a + (size_t)i * dim;
-        float *xr = x + (size_t)i * dim;
+        float *xr = x + (size_t)(r0 + i) * dim;
         for (int j = 0; j < dim; j++) xr[j] += tanhf(g[j]) * ar[j];
     }
     free(a);
 
     /* norm2 + modulate 2, SwiGLU FFN */
-    memcpy(xm, x, (size_t)n_tok * dim * sizeof(float));
-    qw_layernorm(xm, n_tok, dim, tf->eps);
-    for (int i = 0; i < n_tok; i++) {
-        const float *sc = is_target[i] ? sc2T : sc20;
+    memcpy(xm, x + (size_t)r0 * dim, (size_t)n * dim * sizeof(float));
+    qw_layernorm(xm, n, dim, tf->eps);
+    for (int i = 0; i < n; i++) {
+        const float *sc = is_target[r0 + i] ? sc2T : sc20;
         float *row = xm + (size_t)i * dim;
         for (int j = 0; j < dim; j++) row[j] *= 1.0f + sc[j];
     }
-    float *gate = malloc((size_t)n_tok * tf->mlp_dim * sizeof(float));
-    float *up = malloc((size_t)n_tok * tf->mlp_dim * sizeof(float));
-    qw_gemm(xm, tf->mlp_gate[b], gate, n_tok, dim, tf->mlp_dim);
-    qw_gemm(xm, tf->mlp_proj[b], up, n_tok, dim, tf->mlp_dim);
-    qw_silu(gate, n_tok * tf->mlp_dim);
-    for (int i = 0; i < n_tok * tf->mlp_dim; i++) gate[i] *= up[i];
+    float *gate = malloc((size_t)n * tf->mlp_dim * sizeof(float));
+    float *up = malloc((size_t)n * tf->mlp_dim * sizeof(float));
+    qw_gemm(xm, tf->mlp_gate[b], gate, n, dim, tf->mlp_dim);
+    qw_gemm(xm, tf->mlp_proj[b], up, n, dim, tf->mlp_dim);
+    qw_silu(gate, n * tf->mlp_dim);
+    for (int i = 0; i < n * tf->mlp_dim; i++) gate[i] *= up[i];
     free(up);
-    float *h = malloc((size_t)n_tok * dim * sizeof(float));
-    qw_gemm(gate, tf->mlp_out[b], h, n_tok, tf->mlp_dim, dim);
+    float *h = malloc((size_t)n * dim * sizeof(float));
+    qw_gemm(gate, tf->mlp_out[b], h, n, tf->mlp_dim, dim);
     free(gate);
-    for (int i = 0; i < n_tok; i++) {
-        const float *g = is_target[i] ? g2T : g20;
+    for (int i = 0; i < n; i++) {
+        const float *g = is_target[r0 + i] ? g2T : g20;
         const float *hr = h + (size_t)i * dim;
-        float *xr = x + (size_t)i * dim;
+        float *xr = x + (size_t)(r0 + i) * dim;
         for (int j = 0; j < dim; j++) xr[j] += tanhf(g[j]) * hr[j];
     }
     free(h);
@@ -1191,7 +1212,7 @@ void qw_transformer_forward(qw_transformer_t *tf,
     float *xm = malloc((size_t)N * dim * sizeof(float));
     for (int b = 0; b < tf->n_layers; b++) {
         qw_block(tf, b, x, xm, N, modT, mod0, is_target, qk_c, qk_s,
-                 block_id, key_valid);
+                 block_id, key_valid, 0, 0, NULL, NULL, NULL, NULL);
     }
     free(xm);
 
@@ -1294,7 +1315,8 @@ void qw_transformer_forward_edit(qw_transformer_t *tf,
                                  const int *txt_mask,   /* [n_vlm] or NULL */
                                  const int *img_mask,   /* [n_slots] */
                                  int n_slots,
-                                 float sigma, float *v) /* [n_target, in_ch] */
+                                 float sigma, float *v, /* [n_target, in_ch] */
+                                 int cache_mode)        /* 0 none, 1 fill, 2 use */
 {
     int dim = tf->dim, hd = tf->head_dim;
     int tgt_h = shapes[3 * (n_shapes - 1) + 1];
@@ -1382,8 +1404,29 @@ void qw_transformer_forward_edit(qw_transformer_t *tf,
     }
 
     /* Joint hidden states: text rows through txt_in, image rows through
-     * img_in, both scattered into slot order. */
-    {
+     * img_in, both scattered into slot order. In cache-use mode only the
+     * target rows matter (the prefix lives in the cache); the target block
+     * is last, so those rows are the tail of both z and x. */
+    int n_prefix = N - n_target;
+    int cm = cache_mode;
+    if (cm == 2 && (tf->kvc_rows != n_prefix || !tf->kvc_k)) cm = 1;
+    if (cm == 1) {
+        if (tf->kvc_rows != n_prefix) {
+            free(tf->kvc_k); free(tf->kvc_v);
+            tf->kvc_k = tf->kvc_v = NULL;
+            tf->kvc_rows = 0;
+            size_t bytes = (size_t)tf->n_layers * n_prefix * dim * sizeof(float);
+            tf->kvc_k = malloc(bytes);
+            tf->kvc_v = malloc(bytes);
+            if (tf->kvc_k && tf->kvc_v) tf->kvc_rows = n_prefix;
+            else { free(tf->kvc_k); free(tf->kvc_v); tf->kvc_k = tf->kvc_v = NULL; }
+        }
+        if (!tf->kvc_k) cm = 0;   /* allocation failed: plain full passes */
+    }
+    if (cm == 2) {
+        qw_gemm(z + (size_t)(n_img_tot - n_target) * tf->in_ch, tf->img_in,
+                x + (size_t)n_prefix * dim, n_target, tf->in_ch, dim);
+    } else {
         float *enc = malloc((size_t)n_txt * tf->ctx_dim * sizeof(float));
         float *ptx = malloc((size_t)n_txt * dim * sizeof(float));
         float *pim = malloc((size_t)n_img_tot * dim * sizeof(float));
@@ -1426,23 +1469,40 @@ void qw_transformer_forward_edit(qw_transformer_t *tf,
     qw_time_mod_rows(tf, 1000.0f * sigma, modT, mod0, soutT, sout0);
 
     float *xm = malloc((size_t)N * dim * sizeof(float));
+    int r0 = cm == 2 ? n_prefix : 0;
     for (int b = 0; b < tf->n_layers; b++)
         qw_block(tf, b, x, xm, N, modT, mod0, is_target, qk_c, qk_s,
-                 block_id, key_valid);
+                 block_id, key_valid, r0,
+                 cm == 1 ? n_prefix : 0,
+                 cm == 1 ? tf->kvc_k + (size_t)b * n_prefix * dim : NULL,
+                 cm == 1 ? tf->kvc_v + (size_t)b * n_prefix * dim : NULL,
+                 cm == 2 ? tf->kvc_k + (size_t)b * n_prefix * dim : NULL,
+                 cm == 2 ? tf->kvc_v + (size_t)b * n_prefix * dim : NULL);
     free(xm);
 
-    qw_layernorm(x, N, dim, tf->eps);
-    for (int i = 0; i < N; i++) {
-        const float *sc = is_target[i] ? soutT : sout0;
-        float *row = x + (size_t)i * dim;
-        for (int j = 0; j < dim; j++) row[j] *= 1.0f + sc[j];
+    if (cm == 2) {
+        /* Only the target rows reach norm_out/proj_out. */
+        qw_layernorm(x + (size_t)n_prefix * dim, n_target, dim, tf->eps);
+        for (int i = 0; i < n_target; i++) {
+            float *row = x + (size_t)(n_prefix + i) * dim;
+            for (int j = 0; j < dim; j++) row[j] *= 1.0f + soutT[j];
+        }
+        qw_gemm(x + (size_t)n_prefix * dim, tf->proj_out, v, n_target, dim, tf->in_ch);
+    } else {
+        qw_layernorm(x, N, dim, tf->eps);
+        for (int i = 0; i < N; i++) {
+            const float *sc = is_target[i] ? soutT : sout0;
+            float *row = x + (size_t)i * dim;
+            for (int j = 0; j < dim; j++) row[j] *= 1.0f + sc[j];
+        }
+        /* The target block is the last one, so its rows are the tail. */
+        float *out = malloc((size_t)N * tf->in_ch * sizeof(float));
+        qw_gemm(x, tf->proj_out, out, N, dim, tf->in_ch);
+        memcpy(v, out + (size_t)(N - n_target) * tf->in_ch,
+               (size_t)n_target * tf->in_ch * sizeof(float));
+        free(out);
     }
-    /* The target block is the last one, so its rows are the tail. */
-    float *out = malloc((size_t)N * tf->in_ch * sizeof(float));
-    qw_gemm(x, tf->proj_out, out, N, dim, tf->in_ch);
-    memcpy(v, out + (size_t)(N - n_target) * tf->in_ch,
-           (size_t)n_target * tf->in_ch * sizeof(float));
-    free(out); free(x);
+    free(x);
     free(modT); free(mod0); free(soutT); free(sout0);
     free(block_id); free(is_target); free(key_valid);
     free(qk_c); free(qk_s); free(blk_start); free(blk_len);
@@ -1477,11 +1537,15 @@ float *iris_sample_euler_qwen21_edit(qw_transformer_t *tf,
         memcpy(zin + (size_t)n_cond * tf->in_ch, z,
                (size_t)n_target * tf->in_ch * sizeof(float));
         qw_transformer_forward_edit(tf, zin, shapes, n_shapes, txt, txt_mask,
-                                    img_mask, n_slots, schedule[i], vel);
+                                    img_mask, n_slots, schedule[i], vel,
+                                    i == 0 ? 1 : 2);
         float dsig = schedule[i + 1] - schedule[i];
         for (int j = 0; j < n_target * tf->in_ch; j++) z[j] += dsig * vel[j];
         if (progress) progress(i + 1, num_steps);
     }
+    /* Release the prefix cache before VAE work begins. */
+    free(tf->kvc_k); free(tf->kvc_v);
+    tf->kvc_k = tf->kvc_v = NULL; tf->kvc_rows = 0;
     free(zin); free(vel); free(shapes);
     return z;
 }
