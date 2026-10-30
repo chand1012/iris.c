@@ -1100,6 +1100,372 @@ static int qw_forward_dev(qw_transformer_t *tf, const float *z, const float *txt
     iris_dev_download(v, d->in_f32, (size_t)n_img * tf->in_ch * sizeof(float));
     return 1;
 }
+/* Text-row attention on the host for the editing layout. Text queries are
+ * causal over the whole joint prefix (they see every earlier token, text or
+ * image), so their attention cannot run through the non-causal SDPA kernel
+ * with a block mask. Rows [0,P) of the mapped device q/k/v are read in
+ * place, the causal pass runs per text row, and outputs are uploaded to
+ * d->att per text run (runs are contiguous in the joint layout). */
+static void qw_text_attn_dev(qw_transformer_t *tf, const uint16_t *dq,
+                             const uint16_t *dk, const uint16_t *dv,
+                             int nrun, const int *rstart, const int *rlen,
+                             const int *kv, int P) {
+    int n_txt = 0;
+    for (int r = 0; r < nrun; r++) n_txt += rlen[r];
+    if (n_txt <= 0) return;
+    int heads = tf->heads, hd = tf->head_dim, dim = tf->dim;
+    float scale = 1.0f / sqrtf((float)hd);
+    iris_dev_sync();   /* this layer's qkv GEMMs must have landed */
+    float *qh = malloc((size_t)n_txt * dim * sizeof(float));
+    float *kh = malloc((size_t)P * dim * sizeof(float));
+    float *vh = malloc((size_t)P * dim * sizeof(float));
+    float *out = malloc((size_t)n_txt * dim * sizeof(float));
+    int *qpos = malloc((size_t)n_txt * sizeof(int));
+    for (size_t i = 0; i < (size_t)P * dim; i++) {
+        kh[i] = qw_bf16_to_f32(dk[i]);
+        vh[i] = qw_bf16_to_f32(dv[i]);
+    }
+    int cum = 0;
+    for (int r = 0; r < nrun; r++)
+        for (int o = 0; o < rlen[r]; o++, cum++) {
+            const uint16_t *src = dq + (size_t)(rstart[r] + o) * dim;
+            float *dst = qh + (size_t)cum * dim;
+            qpos[cum] = rstart[r] + o;
+            for (int j = 0; j < dim; j++) dst[j] = qw_bf16_to_f32(src[j]);
+        }
+    float *scores = malloc((size_t)n_txt * P * sizeof(float));
+    for (int h = 0; h < heads; h++) {
+#ifdef USE_BLAS
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n_txt, P, hd, scale,
+                    qh + h * hd, dim, kh + h * hd, dim, 0.0f, scores, P);
+#else
+        for (int i = 0; i < n_txt; i++)
+            for (int j = 0; j < P; j++) {
+                float acc = 0.0f;
+                for (int e = 0; e < hd; e++)
+                    acc += qh[(size_t)i * dim + h * hd + e] * kh[(size_t)j * dim + h * hd + e];
+                scores[(size_t)i * P + j] = scale * acc;
+            }
+#endif
+        for (int i = 0; i < n_txt; i++) {
+            float *sr = scores + (size_t)i * P;
+            int lim = qpos[i];
+            float mx = -INFINITY;
+            for (int j = 0; j < P; j++) {
+                if (j > lim || !kv[j]) { sr[j] = -INFINITY; continue; }
+                if (sr[j] > mx) mx = sr[j];
+            }
+            if (mx == -INFINITY) { memset(sr, 0, (size_t)P * sizeof(float)); continue; }
+            float sum = 0.0f;
+            for (int j = 0; j < P; j++) { sr[j] = expf(sr[j] - mx); sum += sr[j]; }
+            for (int j = 0; j < P; j++) sr[j] /= sum;
+        }
+#ifdef USE_BLAS
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, n_txt, hd, P, 1.0f,
+                    scores, P, vh + h * hd, dim, 0.0f, out + h * hd, dim);
+#else
+        for (int i = 0; i < n_txt; i++)
+            for (int e = 0; e < hd; e++) {
+                float acc = 0.0f;
+                for (int j = 0; j < P; j++)
+                    acc += scores[(size_t)i * P + j] * vh[(size_t)j * dim + h * hd + e];
+                out[(size_t)i * dim + h * hd + e] = acc;
+            }
+#endif
+    }
+    free(scores); free(qpos);
+    /* bf16 the outputs and upload per text run. */
+    uint16_t *b16 = (uint16_t *)kh;   /* reuse: P*dim >= n_txt*dim */
+    size_t m = 0;
+    for (size_t i = 0; i < (size_t)n_txt * dim; i++) {
+        uint32_t u; memcpy(&u, &out[i], 4);
+        u += 0x8000u;
+        b16[m++] = (uint16_t)(u >> 16);
+    }
+    cum = 0;
+    for (int r = 0; r < nrun; r++) {
+        if (rlen[r] > 0)
+            iris_dev_upload(tf->dev ? ((struct qw_dev *)tf->dev)->att + (size_t)rstart[r] * dim
+                                    : NULL,
+                            b16 + (size_t)cum * dim, (size_t)rlen[r] * dim * sizeof(uint16_t));
+        cum += rlen[r];
+    }
+    free(qh); free(kh); free(vh); free(out);
+}
+
+/* GPU forward for the editing layout (joint text/image slot sequence, the
+ * target block last). Mirrors qw_forward_dev with three layout changes:
+ * rows [0,P) use the t=0 modulation and [P,N) the sigma modulation; RoPE
+ * comes from the shared-cursor walk; attention is per image block (SDPA
+ * over the position prefix + own rows) plus a causal host pass for text
+ * rows. No KV cache on the device path (full passes every step). */
+static int qw_forward_dev_edit(qw_transformer_t *tf, const float *z,
+                               const int *shapes, int n_shapes,
+                               const float *txt, const int *txt_mask,
+                               const int *img_mask, int n_slots,
+                               float sigma, float *v) {
+    struct qw_dev *d = tf->dev;
+    int dim = tf->dim, heads = tf->heads, hd = tf->head_dim, half = hd / 2;
+    int mlp = tf->mlp_dim, in_ch = tf->in_ch, ctx = tf->ctx_dim;
+
+    int tgt_h = shapes[3 * (n_shapes - 1) + 1], tgt_w = shapes[3 * (n_shapes - 1) + 2];
+    int n_target = tgt_h * tgt_w;
+    int n_img_tot = 0;
+    for (int s = 0; s < n_shapes; s++) n_img_tot += shapes[3 * s + 1] * shapes[3 * s + 2];
+    int n_img_slots = 0;
+    for (int s = 0; s < n_slots; s++) n_img_slots += img_mask[s] ? 1 : 0;
+    if (n_img_slots * 4 != n_img_tot) return 0;
+    int n_txt = n_slots - n_img_slots;
+    int N = n_txt + n_img_tot, P = N - n_target;
+
+    int *blk_start = calloc(n_shapes, sizeof(int));
+    int *blk_len = calloc(n_shapes, sizeof(int));
+    int *rstart = malloc((n_txt + 1) * sizeof(int));
+    int *rlen = malloc((n_txt + 1) * sizeof(int));
+    int nrun = 0;
+    for (int s = 0; s < n_shapes; s++) blk_len[s] = shapes[3 * s + 1] * shapes[3 * s + 2];
+    {
+        int tok = 0, b = 0, seen = 0;
+        for (int s = 0; s < n_slots; s++) {
+            if (!img_mask[s]) {
+                if (nrun == 0 || rlen[nrun - 1] == 0) { rstart[nrun] = tok; rlen[nrun] = 0; nrun++; }
+                rlen[nrun - 1]++; tok++;
+            } else {
+                if (nrun == 0 || rlen[nrun - 1] > 0) { rstart[nrun] = tok; rlen[nrun] = 0; nrun++; }
+                rlen[nrun - 1] = 0;   /* close the run at the first image slot */
+                while (b < n_shapes && seen >= blk_len[b]) { b++; seen = 0; }
+                if (seen == 0) blk_start[b] = tok;
+                tok += 4; seen += 4;
+            }
+        }
+        /* drop empty runs created when a block directly follows a block */
+        int w = 0;
+        for (int r = 0; r < nrun; r++)
+            if (rlen[r] > 0) { rstart[w] = rstart[r]; rlen[w] = rlen[r]; w++; }
+        nrun = w;
+    }
+
+    size_t in_elems = (size_t)n_txt * ctx;
+    if ((size_t)n_txt * dim > in_elems) in_elems = (size_t)n_txt * dim;
+    if ((size_t)n_img_tot * in_ch > in_elems) in_elems = (size_t)n_img_tot * in_ch;
+    if (!qw_dev_ensure(tf, N, in_elems)) {
+        fprintf(stderr, "Qwen-Image 2.1: GPU allocation failed for %d tokens\n", N);
+        free(blk_start); free(blk_len); free(rstart); free(rlen);
+        return 0;
+    }
+
+    /* Joint x: text rows projected on the host (uploaded per run), image
+     * blocks through img_in on-device (blocks are contiguous in x). */
+    if (n_txt > 0) {
+        float *enc = malloc((size_t)n_txt * ctx * sizeof(float));
+        int ti = 0;
+        for (int s = 0; s < n_slots; s++)
+            if (!img_mask[s]) {
+                memcpy(enc + (size_t)ti * ctx, txt + (size_t)s * ctx, ctx * sizeof(float));
+                ti++;
+            }
+        qw_rmsnorm(enc, n_txt, ctx, tf->txt_norm_w, 1, tf->eps);
+        iris_dev_upload(d->in_f32, enc, (size_t)n_txt * ctx * sizeof(float));
+        iris_dev_f32_to_bf16(d->in_b16, d->in_f32, (size_t)n_txt * ctx);
+        free(enc);
+        iris_dev_linear_f32(d->o1, d->in_b16, d->txt_in, n_txt, ctx, dim);
+        float *pin = malloc((size_t)n_txt * dim * sizeof(float));
+        iris_dev_download(pin, d->o1, (size_t)n_txt * dim * sizeof(float));
+        qw_gelu_tanh(pin, n_txt * dim);
+        iris_dev_upload(d->in_f32, pin, (size_t)n_txt * dim * sizeof(float));
+        iris_dev_f32_to_bf16(d->in_b16, d->in_f32, (size_t)n_txt * dim);
+        free(pin);
+        iris_dev_linear_f32(d->o1, d->in_b16, d->txt_out, n_txt, dim, dim);
+        float *ptx = malloc((size_t)n_txt * dim * sizeof(float));
+        iris_dev_download(ptx, d->o1, (size_t)n_txt * dim * sizeof(float));
+        int cum = 0;
+        for (int r = 0; r < nrun; r++) {
+            iris_dev_upload(d->x + (size_t)rstart[r] * dim, ptx + (size_t)cum * dim,
+                            (size_t)rlen[r] * dim * sizeof(float));
+            cum += rlen[r];
+        }
+        free(ptx);
+    }
+    {
+        int cum = 0;
+        for (int b = 0; b < n_shapes; b++) {
+            iris_dev_upload(d->in_f32, z + (size_t)cum * in_ch,
+                            (size_t)blk_len[b] * in_ch * sizeof(float));
+            iris_dev_f32_to_bf16(d->in_b16, d->in_f32, (size_t)blk_len[b] * in_ch);
+            iris_dev_linear_f32(d->x + (size_t)blk_start[b] * dim, d->in_b16,
+                                d->img_in, blk_len[b], in_ch, dim);
+            cum += blk_len[b];
+        }
+    }
+
+    /* Timestep embeddings, modulation, gates: identical to t2i. */
+    float t = 1000.0f * sigma;
+    float embT[256], emb0[256];
+    qw_time_embed(embT, t);
+    for (int j = 0; j < 128; j++) { emb0[j] = 1.0f; emb0[128 + j] = 0.0f; }
+    iris_dev_upload(d->vec + d->o_sin, embT, 256 * sizeof(float));
+    iris_dev_upload(d->vec + d->o_sin + 256, emb0, 256 * sizeof(float));
+    iris_dev_f32_to_bf16(d->vec_b16 + d->o_sin, d->vec + d->o_sin, 256);
+    iris_dev_f32_to_bf16(d->vec_b16 + d->o_sin + 256, d->vec + d->o_sin + 256, 256);
+    float *h1T = d->vec + d->o_h1, *h10 = h1T + dim;
+    iris_dev_linear_f32(h1T, d->vec_b16 + d->o_sin, d->time_lin1, 1, 256, dim);
+    iris_dev_silu(h1T, dim);
+    iris_dev_f32_to_bf16(d->vec_b16 + d->o_h1, h1T, dim);
+    float *tembT = d->vec + d->o_temb, *temb0 = tembT + dim;
+    iris_dev_linear_f32(tembT, d->vec_b16 + d->o_h1, d->time_lin2, 1, dim, dim);
+    iris_dev_linear_f32(h10, d->vec_b16 + d->o_sin + 256, d->time_lin1, 1, 256, dim);
+    iris_dev_silu(h10, dim);
+    iris_dev_f32_to_bf16(d->vec_b16 + d->o_h1 + dim, h10, dim);
+    iris_dev_linear_f32(temb0, d->vec_b16 + d->o_h1 + dim, d->time_lin2, 1, dim, dim);
+    float *modT = d->vec + d->o_mod, *mod0 = modT + 4 * dim;
+    float *soutT = d->vec + d->o_sout, *sout0 = soutT + dim;
+    iris_dev_sync();
+    qw_silu(tembT, dim);
+    qw_silu(temb0, dim);
+    iris_dev_f32_to_bf16(d->vec_b16 + d->o_act, tembT, dim);
+    iris_dev_f32_to_bf16(d->vec_b16 + d->o_act + dim, temb0, dim);
+    iris_dev_linear_f32(modT, d->vec_b16 + d->o_act, d->modulation, 1, dim, 4 * dim);
+    iris_dev_linear_f32(mod0, d->vec_b16 + d->o_act + dim, d->modulation, 1, dim, 4 * dim);
+    iris_dev_linear_f32(soutT, d->vec_b16 + d->o_act, d->norm_out_lin, 1, dim, dim);
+    iris_dev_linear_f32(sout0, d->vec_b16 + d->o_act + dim, d->norm_out_lin, 1, dim, dim);
+    {
+        iris_dev_sync();
+        float *g1T = d->vec + d->o_tg, *g2T = g1T + dim, *g10 = g2T + dim, *g20 = g10 + dim;
+        for (int j = 0; j < dim; j++) { g1T[j] = tanhf(modT[dim + j]);     g2T[j] = tanhf(modT[3 * dim + j]); }
+        for (int j = 0; j < dim; j++) { g10[j] = tanhf(mod0[dim + j]);     g20[j] = tanhf(mod0[3 * dim + j]); }
+    }
+
+    /* Per-token RoPE from the shared-cursor walk, plus key validity. */
+    float *qk_c = malloc((size_t)N * hd * sizeof(float));
+    float *qk_s = malloc((size_t)N * hd * sizeof(float));
+    int *kv = malloc((size_t)N * sizeof(int));
+    {
+        int tok = 0, ti = 0;
+        for (int s = 0; s < n_slots; s++) {
+            if (!img_mask[s]) { kv[tok++] = txt_mask ? txt_mask[ti] : 1; ti++; }
+            else { kv[tok] = kv[tok + 1] = kv[tok + 2] = kv[tok + 3] = 1; tok += 4; }
+        }
+        for (int i = P; i < N; i++) kv[i] = 1;
+    }
+    {
+        int cursor = 0, position = 0;
+        for (int b = 0; b < n_shapes; b++) {
+            int h = shapes[3 * b + 1], w = shapes[3 * b + 2];
+            int text_len = blk_start[b] - cursor;
+            for (int i = 0; i < text_len; i++) {
+                int p = position + i;
+                qw_token_rope(tf, p, p, p, qk_c + (size_t)(cursor + i) * hd,
+                              qk_s + (size_t)(cursor + i) * hd);
+            }
+            position += text_len;
+            int hh = h - h / 2, ww = w - w / 2;
+            for (int r = 0; r < h; r++)
+                for (int c = 0; c < w; c++) {
+                    int tok = blk_start[b] + r * w + c;
+                    qw_token_rope(tf, position, r - hh, c - ww,
+                                  qk_c + (size_t)tok * hd, qk_s + (size_t)tok * hd);
+                }
+            position += (h > w ? h : w);
+            cursor = blk_start[b] + h * w;
+        }
+        for (int i = cursor; i < N; i++) {
+            int p = position + (i - cursor);
+            qw_token_rope(tf, p, p, p, qk_c + (size_t)i * hd, qk_s + (size_t)i * hd);
+        }
+    }
+    {
+        float *rc = malloc((size_t)N * half * sizeof(float));
+        float *rs = malloc((size_t)N * half * sizeof(float));
+        for (int i = 0; i < N; i++)
+            for (int p = 0; p < half; p++) {
+                rc[(size_t)i * half + p] = qk_c[(size_t)i * hd + 2 * p];
+                rs[(size_t)i * half + p] = qk_s[(size_t)i * hd + 2 * p];
+            }
+        iris_dev_upload(d->rope_c, rc, (size_t)N * half * sizeof(float));
+        iris_dev_upload(d->rope_s, rs, (size_t)N * half * sizeof(float));
+        free(rc); free(rs);
+    }
+
+    /* SDPA key masks: image block b sees every token before it ends
+     * (causal prefix) plus its own rows, gated by key validity. The target
+     * block (last) sees the whole sequence. */
+    int *masks = malloc((size_t)n_shapes * N * sizeof(int));
+    for (int b = 0; b < n_shapes; b++) {
+        int end = blk_start[b] + blk_len[b];
+        int *mb = masks + (size_t)b * N;
+        for (int j = 0; j < N; j++) mb[j] = (j < end) ? kv[j] : 0;
+    }
+
+    float scale = 1.0f / sqrtf((float)hd);
+    uint16_t *dq = d->qkv, *dk = d->qkv + (size_t)d->seq * dim,
+             *dv = dk + (size_t)d->seq * dim;
+    for (int b = 0; b < tf->n_layers; b++) {
+        qw_dev_block_t *bl = &d->blocks[b];
+        for (int seg = 0; seg < 2; seg++) {
+            int start = seg ? P : 0, len = seg ? n_target : P;
+            if (len <= 0) continue;
+            const float *m = seg ? modT : mod0;
+            iris_dev_layer_norm_mod(d->norm + (size_t)start * dim, d->x + (size_t)start * dim,
+                                    NULL, m, len, dim, tf->eps);
+        }
+        iris_dev_linear_bf16(dq, d->norm, bl->to_q, N, dim, dim);
+        iris_dev_linear_bf16(dk, d->norm, bl->to_k, N, dim, dim);
+        iris_dev_linear_bf16(dv, d->norm, bl->to_v, N, dim, dim);
+        iris_dev_head_norm_rope(dq, dim, bl->norm_q, d->rope_c, d->rope_s, N, heads, hd, tf->eps, 0);
+        iris_dev_head_norm_rope(dk, dim, bl->norm_k, d->rope_c, d->rope_s, N, heads, hd, tf->eps, 0);
+        qw_text_attn_dev(tf, dq, dk, dv, nrun, rstart, rlen, kv, P);
+        for (int ib = 0; ib < n_shapes; ib++) {
+            iris_dev_upload(d->mask, masks + (size_t)ib * N, (size_t)N * sizeof(int));
+            iris_dev_attention(d->att + (size_t)blk_start[ib] * dim, dim,
+                               dq + (size_t)blk_start[ib] * dim, dk, dv, dim,
+                               blk_len[ib], N, heads, heads, hd, scale, 0, d->mask);
+        }
+        iris_dev_linear_f32(d->o1, d->att, bl->to_out, N, dim, dim);
+        for (int seg = 0; seg < 2; seg++) {
+            int start = seg ? P : 0, len = seg ? n_target : P;
+            if (len <= 0) continue;
+            size_t go = seg ? 0 : 2 * dim;   /* seg1: g1T/g2T; seg0: g10/g20 */
+            iris_dev_residual(d->x + (size_t)start * dim, d->o1 + (size_t)start * dim,
+                              d->vec + d->o_tg + go, len, dim);
+        }
+        for (int seg = 0; seg < 2; seg++) {
+            int start = seg ? P : 0, len = seg ? n_target : P;
+            if (len <= 0) continue;
+            const float *m = seg ? modT : mod0;
+            iris_dev_layer_norm_mod(d->cat + (size_t)start * dim, d->x + (size_t)start * dim,
+                                    NULL, m + 2 * dim, len, dim, tf->eps);
+        }
+        iris_dev_linear_bf16(d->gate, d->cat, bl->mlp_gate, N, dim, mlp);
+        iris_dev_linear_bf16(d->ffn, d->cat, bl->mlp_proj, N, dim, mlp);
+        iris_dev_swiglu(d->ffn, mlp, d->gate, d->ffn, mlp, N, mlp);
+        iris_dev_linear_f32(d->o2, d->ffn, bl->mlp_out, N, mlp, dim);
+        for (int seg = 0; seg < 2; seg++) {
+            int start = seg ? P : 0, len = seg ? n_target : P;
+            if (len <= 0) continue;
+            size_t go = seg ? 0 : 2 * dim;
+            iris_dev_residual(d->x + (size_t)start * dim, d->o2 + (size_t)start * dim,
+                              d->vec + d->o_tg + go + dim, len, dim);
+        }
+    }
+
+    /* norm_out + proj_out on the target rows (the tail). */
+    {
+        float *nf = malloc((size_t)n_target * dim * sizeof(float));
+        iris_dev_download(nf, d->x + (size_t)P * dim, (size_t)n_target * dim * sizeof(float));
+        qw_layernorm(nf, n_target, dim, tf->eps);
+        const float *sc = d->vec + d->o_sout;   /* soutT */
+        for (size_t i = 0; i < (size_t)n_target * dim; i++) nf[i] *= 1.0f + sc[i % dim];
+        iris_dev_upload(d->o1, nf, (size_t)n_target * dim * sizeof(float));
+        free(nf);
+        iris_dev_f32_to_bf16(d->att, d->o1, (size_t)n_target * dim);
+        iris_dev_linear_f32(d->in_f32, d->att, d->proj_out, n_target, dim, in_ch);
+    }
+    iris_dev_sync();
+    iris_dev_download(v, d->in_f32, (size_t)n_target * in_ch * sizeof(float));
+    free(qk_c); free(qk_s); free(kv); free(masks);
+    free(blk_start); free(blk_len); free(rstart); free(rlen);
+    return 1;
+}
 #endif /* IRIS_DEV */
 
 void qw_transformer_forward(qw_transformer_t *tf,
@@ -1307,6 +1673,16 @@ void qw_transformer_forward_edit(qw_transformer_t *tf,
                                  float sigma, float *v, /* [n_target, in_ch] */
                                  int cache_mode)        /* 0 none, 1 fill, 2 use */
 {
+#ifdef IRIS_DEV
+    if (tf->dev) {
+        /* The device path runs full passes (no KV cache); the host cache is
+         * only used on CPU builds. */
+        if (qw_forward_dev_edit(tf, z, shapes, n_shapes, txt, txt_mask, img_mask,
+                                n_slots, sigma, v))
+            return;
+        /* device forward failed: fall through to the CPU path */
+    }
+#endif
     int dim = tf->dim, hd = tf->head_dim;
     int tgt_h = shapes[3 * (n_shapes - 1) + 1];
     int tgt_w = shapes[3 * (n_shapes - 1) + 2];
