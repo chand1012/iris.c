@@ -689,10 +689,9 @@ static void qw_blend_h(float *a, int ah, int aw, float *b, int bw, int c, int e)
         float wb = x / (float)e;
         for (int ch = 0; ch < c; ch++)
             for (int y = 0; y < ah; y++) {
-                const float *ra = a + ((size_t)ch * ah + y) * aw;
-                float *rb = b + ((size_t)ch * ah + y) * bw;
-                for (int xx = 0; xx < e; xx++)
-                    rb[xx] = ra[aw - e + xx] * wa + rb[xx] * wb;
+                const float *ra = a + ((size_t)ch * ah + y) * aw + (aw - e + x);
+                float *rb = b + ((size_t)ch * ah + y) * bw + x;
+                *rb = *ra * wa + *rb * wb;
             }
     }
 }
@@ -704,7 +703,10 @@ float *iris_vae_qwen_encode(iris_vae_qwen_t *v, const float *rgba, int H, int W,
     *out_w = lw;
 
     float *mom;
-    if (!tile || (H <= QWVAE_TILE && W <= QWVAE_TILE)) {
+    /* Full-image encode matches the reference exactly; tiling is a memory
+     * fallback only (per-tile GroupNorm shifts results). At 1024^2 the full
+     * core peaks at ~5 GB, well inside budget. */
+    if (!tile || (H <= 1024 && W <= 1024)) {
         mom = qw_encode_core(v, rgba, H, W);
     } else {
         /* latent-space tiling: 16/12 tiles, blend 4 */
@@ -746,13 +748,14 @@ float *iris_vae_qwen_encode(iris_vae_qwen_t *v, const float *rgba, int H, int W,
                 row[idx] = tl;
                 row_lh[idx] = tlh;
             }
-            for (int idx = 0; idx < ncol; idx++) free(row[idx]);
-            free(row);
+            /* retire the previous row; the current one becomes prev */
+            for (int idx = 0; idx < ncol; idx++) free(prev[idx]);
             free(prev);
-            prev = row;   /* current row becomes the previous one */
             free(prev_lh);
+            prev = row;
             prev_lh = row_lh;
         }
+        for (int idx = 0; idx < ncol; idx++) free(prev[idx]);
         free(prev);
         free(prev_lh);
     }
@@ -814,13 +817,14 @@ float *iris_vae_qwen_decode(iris_vae_qwen_t *v, const float *latents, int lh, in
             row[idx] = ti;
             row_sh[idx] = tsh;
         }
-        for (int idx = 0; idx < ncol; idx++) free(row[idx]);
-        free(row);
+        /* retire the previous row; the current one becomes prev */
+        for (int idx = 0; idx < ncol; idx++) free(prev[idx]);
         free(prev);
-        prev = row;
         free(prev_sh);
+        prev = row;
         prev_sh = row_sh;
     }
+    for (int idx = 0; idx < ncol; idx++) free(prev[idx]);
     free(prev);
     free(prev_sh);
     qw_clamp(img, (size_t)4 * H * W);

@@ -9,6 +9,7 @@
 #include "iris_kernels.h"
 #include "iris_safetensors.h"
 #include "iris_qwen3.h"
+#include "iris_vision_qwen3vl.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -148,6 +149,14 @@ extern float *iris_sample_euler_qwen21(qw_transformer_t *tf, float *z,
                                        int s_txt, const int *txt_mask,
                                        const float *schedule, int num_steps,
                                        void (*progress)(int step, int total));
+extern float *iris_sample_euler_qwen21_edit(qw_transformer_t *tf, float *z,
+                                       const float *ref_z, const int *ref_hw,
+                                       int n_refs, const float *txt,
+                                       const int *txt_mask, int n_txt,
+                                       const int *img_mask, int n_slots,
+                                       int img_h, int img_w,
+                                       const float *schedule, int num_steps,
+                                       void (*progress)(int step, int total));
 
 /* Z-Image transformer and sampling */
 typedef struct zi_transformer zi_transformer_t;
@@ -235,6 +244,7 @@ struct iris_ctx {
     iris_transformer_flux3_t *flux3_transformer;
     qw_transformer_t *qw_transformer;
     iris_vae_qwen_t *qw_vae;
+    qwv_model_t *qw_vis;
 
     /* Configuration */
     int max_width;
@@ -723,6 +733,7 @@ void iris_free(iris_ctx *ctx) {
     iris_transformer_free_flux3(ctx->flux3_transformer);
     qw_transformer_free(ctx->qw_transformer);
     iris_vae_qwen_free(ctx->qw_vae);
+    qwv_free(ctx->qw_vis);
 
     free(ctx);
 }
@@ -1158,6 +1169,311 @@ static iris_image *iris_generate_qwen21(iris_ctx *ctx, const char *prompt,
         }
     free(rgba);
     return img;
+}
+
+/* Read the vision preprocessor normalization (image_mean/image_std) from
+ * the processor config; defaults to 0.5/0.5 as in Qwen3-VL. */
+static void qwen21_pp_norm(const char *model_dir, float mean[3], float std[3]) {
+    for (int i = 0; i < 3; i++) { mean[i] = 0.5f; std[i] = 0.5f; }
+    char path[512];
+    snprintf(path, sizeof(path), "%s/processor/preprocessor_config.json", model_dir);
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *buf = malloc(sz + 1);
+    if (buf && fread(buf, 1, sz, f) == (size_t)sz) {
+        buf[sz] = 0;
+        const char *p = strstr(buf, "\"image_mean\"");
+        if (p && (p = strchr(p, '[')))
+            for (int i = 0; i < 3; i++)
+                if (sscanf(p + 1 + i * 2, "%f", &mean[i]) != 1) { }
+        p = strstr(buf, "\"image_std\"");
+        if (p && (p = strchr(p, '[')))
+            for (int i = 0; i < 3; i++)
+                if (sscanf(p + 1 + i * 2, "%f", &std[i]) != 1) { }
+    }
+    free(buf);
+    fclose(f);
+}
+
+/* Qwen-Image 2.1 reference-image editing: reference images provide both
+ * vision-tower embeddings (in the text stream, replacing image_pad slots)
+ * and clean VAE latents (in the image stream); the target is denoised from
+ * noise with the block-causal editing sampler. */
+static iris_image *iris_generate_qwen21_edit(iris_ctx *ctx, const char *prompt,
+                                             const iris_image **refs, int n_refs,
+                                             const iris_params *params) {
+    if (!ctx || !prompt || n_refs <= 0 || !refs[0]) {
+        set_error("Editing needs a reference image");
+        return NULL;
+    }
+    iris_params p = params ? *params : (iris_params)IRIS_PARAMS_DEFAULT;
+    if (p.width <= 0) p.width = IRIS_DEFAULT_WIDTH;
+    if (p.height <= 0) p.height = IRIS_DEFAULT_HEIGHT;
+    if (p.num_steps <= 0) p.num_steps = ctx->default_steps;
+    p.width = (p.width / 32) * 32;
+    p.height = (p.height / 32) * 32;
+    if (p.width < 64) p.width = 64;
+    if (p.height < 64) p.height = 64;
+    if (p.width > IRIS_VAE_MAX_DIM || p.height > IRIS_VAE_MAX_DIM) {
+        set_error("Image dimensions exceed maximum (1792x1792)");
+        return NULL;
+    }
+
+    /* Ensure text encoder, vision tower, and VAE are loaded. */
+    if (!ctx->qwen3_encoder && ctx->model_dir[0]) {
+        if (iris_phase_callback) iris_phase_callback("Loading text encoder", 0);
+        ctx->qwen3_encoder = qwen3_encoder_load(ctx->model_dir, ctx->use_mmap);
+        if (iris_phase_callback) iris_phase_callback("Loading text encoder", 1);
+        if (!ctx->qwen3_encoder) {
+            set_error("Failed to load text encoder");
+            return NULL;
+        }
+    }
+    if (!ctx->qwen3_encoder) {
+        set_error("No text encoder loaded");
+        return NULL;
+    }
+    qwen3_set_extraction_mode(ctx->qwen3_encoder, QWEN3_EXTRACT_QWEN21);
+    if (!ctx->qw_vis) {
+        char dir[512];
+        snprintf(dir, sizeof(dir), "%s/text_encoder", ctx->model_dir);
+        if (iris_phase_callback) iris_phase_callback("Loading vision tower", 0);
+        ctx->qw_vis = qwv_load(dir);
+        if (iris_phase_callback) iris_phase_callback("Loading vision tower", 1);
+        if (!ctx->qw_vis) {
+            set_error("Failed to load Qwen3-VL vision tower");
+            return NULL;
+        }
+    }
+    if (!ctx->qw_vae) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/vae", ctx->model_dir);
+        if (iris_phase_callback) iris_phase_callback("Loading VAE", 0);
+        ctx->qw_vae = iris_vae_qwen_load(path);
+        if (iris_phase_callback) iris_phase_callback("Loading VAE", 1);
+        if (!ctx->qw_vae) {
+            set_error("Failed to load Qwen-Image 2.1 VAE");
+            return NULL;
+        }
+    }
+
+    /* Reference grids: like the reference pipeline, each reference is
+     * resized to fit a 1024^2 area with dims rounded to multiples of 32
+     * (calculate_dimensions); the same resized image feeds vision and VAE. */
+    qwen3_image_grid_t *grids = malloc(n_refs * sizeof(qwen3_image_grid_t));
+    int *ref_hw = malloc(2 * n_refs * sizeof(int));
+    int *ref_px = malloc(2 * n_refs * sizeof(int));
+    float **ref_z = calloc(n_refs, sizeof(float *));
+    if (!grids || !ref_hw || !ref_px) goto fail0;
+    size_t m_total = 0;   /* merged vision tokens across refs */
+    for (int i = 0; i < n_refs; i++) {
+        const iris_image *src = refs[i];
+        double ar = (double)src->width / src->height;
+        int w = (int)lround(sqrt(1024.0 * 1024.0 * ar) / 32.0) * 32;
+        int h = (int)lround((w / ar) / 32.0) * 32;
+        if (h > IRIS_VAE_MAX_DIM) {
+            h = (int)(h / (h / (double)IRIS_VAE_MAX_DIM) / 32.0) * 32;
+            w = (int)(h * ar / 32.0) * 32;
+        }
+        if (w < 64 || h < 64) {
+            set_error("Reference image too small (need >= 64x64)");
+            goto fail0;
+        }
+        ref_px[2 * i] = w;
+        ref_px[2 * i + 1] = h;
+        int gh = h / 16, gw = w / 16;
+        grids[i] = (qwen3_image_grid_t){ 1, gh, gw };
+        ref_hw[2 * i] = gh;
+        ref_hw[2 * i + 1] = gw;
+        m_total += (size_t)(gh / 2) * (gw / 2);
+    }
+
+    float mean[3], std[3];
+    qwen21_pp_norm(ctx->model_dir, mean, std);
+    int vdim = ctx->qw_dim;   /* 4096: vision out_hidden_size */
+    float *merged = malloc(m_total * vdim * sizeof(float));
+    float *ds = malloc(3 * m_total * vdim * sizeof(float));
+    if (!merged || !ds) goto fail0;
+
+    for (int i = 0; i < n_refs; i++) {
+        int w = ref_px[2 * i], h = ref_px[2 * i + 1];
+        const iris_image *src = refs[i];
+        iris_image *owned = NULL;
+        const iris_image *im = src;
+        if (w != src->width || h != src->height) {
+            owned = iris_image_resize(src, w, h);
+            if (!owned) goto fail0;
+            im = owned;
+        }
+        int gh = h / 16, gw = w / 16;
+        size_t rows = (size_t)gh * gw;
+
+        /* Vision pixels: [rows, 3*2*16*16] in [-1,1], merge-block order,
+         * one frame replicated across the temporal patch dim; alpha is
+         * composited over white like the reference preprocessor. */
+        float *px = malloc(rows * 3 * 2 * 256 * sizeof(float));
+        if (!px) { iris_image_free(owned); goto fail0; }
+        for (int br = 0; br < gh / 2; br++)
+        for (int bc = 0; bc < gw / 2; bc++)
+        for (int ir = 0; ir < 2; ir++)
+        for (int ic = 0; ic < 2; ic++) {
+            int grow = br * 2 + ir, gcol = bc * 2 + ic;
+            size_t row = ((size_t)br * (gw / 2) + bc) * 4 + ir * 2 + ic;
+            float *dst = px + row * 3 * 2 * 256;
+            for (int py = 0; py < 16; py++) {
+                int y = grow * 16 + py;
+                for (int px_x = 0; px_x < 16; px_x++) {
+                    int x = gcol * 16 + px_x;
+                    size_t idx = ((size_t)y * w + x) * src->channels;
+                    for (int ch = 0; ch < 3; ch++) {
+                        float v = im->data[idx + ch];
+                        if (im->channels >= 4)
+                            v = v * (im->data[idx + 3] / 255.0f)
+                              + 255.0f * (1.0f - im->data[idx + 3] / 255.0f);
+                        v = (v / 255.0f - mean[ch]) / std[ch];
+                        dst[ch * 512 + py * 16 + px_x] = v;
+                        dst[ch * 512 + 256 + py * 16 + px_x] = v;
+                    }
+                }
+            }
+        }
+
+        /* Merged rows for this ref start at the running merged offset. */
+        size_t m_off = 0;
+        for (int k = 0; k < i; k++)
+            m_off += (size_t)(ref_hw[2 * k] / 2) * (ref_hw[2 * k + 1] / 2);
+        if (qwv_forward(ctx->qw_vis, 1, gh, gw, px,
+                        merged + m_off * vdim, ds + m_off * vdim) != 0) {
+            free(px);
+            iris_image_free(owned);
+            goto fail1;
+        }
+        free(px);
+
+        /* VAE latents: planar RGBA in [-1,1] -> [gh*gw, 64] position-major. */
+        float *pl = malloc((size_t)4 * h * w * sizeof(float));
+        if (!pl) { iris_image_free(owned); goto fail1; }
+        for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            size_t idx = ((size_t)y * w + x) * src->channels;
+            for (int ch = 0; ch < 4; ch++) {
+                float v = ch < 3 ? (float)im->data[idx + ch] : 255.0f;
+                if (ch == 3 && im->channels >= 4) v = im->data[idx + 3];
+                pl[((size_t)ch * h + y) * w + x] = v / 127.5f - 1.0f;
+            }
+        }
+        int lh2, lw2;
+        float *lat = iris_vae_qwen_encode(ctx->qw_vae, pl, h, w, 1, &lh2, &lw2);
+        free(pl);
+        iris_image_free(owned);
+        if (!lat) goto fail1;
+        float *zref = malloc(rows * ctx->qw_in_channels * sizeof(float));
+        if (!zref) { free(lat); goto fail1; }
+        for (size_t j = 0; j < rows; j++)
+            for (int c = 0; c < ctx->qw_in_channels; c++)
+                zref[j * ctx->qw_in_channels + c] = lat[(size_t)c * rows + j];
+        free(lat);
+        ref_z[i] = zref;
+    }
+
+    /* Text stream: image pads expanded in the template, then replaced by
+     * the vision embeddings inside the LM forward. */
+    int n_emb = 0, mask_n = 0, *img_mask = NULL;
+    float *emb = qwen3_encode_images_ex(ctx->qwen3_encoder, prompt, n_refs,
+                                        grids, merged, ds,
+                                        &n_emb, &mask_n, &img_mask);
+    free(merged);
+    free(ds);
+    qwv_free(ctx->qw_vis);
+    ctx->qw_vis = NULL;
+    iris_release_text_encoder(ctx);
+    if (!emb) goto fail0;
+
+    if (!iris_load_qw_transformer_if_needed(ctx)) goto fail1;
+
+    int lh = p.height / 16, lw = p.width / 16;
+    int n_img = lh * lw;
+    int nch = ctx->qw_in_channels;
+    int64_t seed = (p.seed < 0) ? (int64_t)time(NULL) : p.seed;
+    float *z = malloc((size_t)n_img * nch * sizeof(float));
+    if (seed >= 0) iris_rng_seed((uint64_t)seed);
+    iris_randn(z, n_img * nch);
+
+    /* The sampler's slot mask covers [text stream..., target slots]: the
+     * encoder mask flags reference image slots, and each mask slot expands
+     * to 4 image tokens, so the target contributes n_img/4 slots. */
+    int n_tgt_slots = n_img / 4;
+    int n_slots = mask_n + n_tgt_slots;
+    int *slot_mask = malloc(n_slots * sizeof(int));
+    for (int i = 0; i < mask_n; i++) slot_mask[i] = img_mask[i];
+    for (int i = 0; i < n_tgt_slots; i++) slot_mask[mask_n + i] = 1;
+    int *txt_mask = malloc(n_emb * sizeof(int));
+    for (int i = 0; i < n_emb; i++) txt_mask[i] = 1;
+
+    float *schedule = iris_selected_qwen21_schedule(
+        &p, n_img, ctx->qw_shift_base, ctx->qw_shift_max,
+        ctx->qw_shift_base_len, ctx->qw_shift_max_len, ctx->qw_shift_terminal);
+    float *latent = iris_sample_euler_qwen21_edit(ctx->qw_transformer, z,
+                                  (const float *)ref_z[0], ref_hw, n_refs,
+                                  emb, txt_mask, n_emb,
+                                  slot_mask, n_slots, lh, lw,
+                                  schedule, p.num_steps, NULL);
+    free(schedule);
+    free(emb);
+    free(img_mask);
+    free(slot_mask);
+    free(txt_mask);
+    for (int i = 0; i < n_refs; i++) free(ref_z[i]);
+    free(ref_z);
+    free(grids);
+    free(ref_hw);
+    free(ref_px);
+    if (!latent) {
+        set_error("Sampling failed");
+        return NULL;
+    }
+
+    /* Same decode path as txt2img. */
+    float *lat_cm = malloc((size_t)n_img * nch * sizeof(float));
+    for (int i = 0; i < n_img; i++)
+        for (int c = 0; c < nch; c++)
+            lat_cm[(size_t)c * n_img + i] = latent[(size_t)i * nch + c];
+    if (iris_phase_callback) iris_phase_callback("decoding image", 0);
+    int oh = 0, ow = 0;
+    float *rgba = iris_vae_qwen_decode(ctx->qw_vae, lat_cm, lh, lw, 1, &oh, &ow);
+    free(lat_cm);
+    free(latent);
+    if (iris_phase_callback) iris_phase_callback("decoding image", 1);
+    if (!rgba) {
+        set_error("VAE decode failed");
+        return NULL;
+    }
+    iris_image *img = iris_image_create(ow, oh, 4);
+    for (int ch = 0; ch < 4; ch++)
+        for (int y = 0; y < oh; y++) {
+            const float *plane = rgba + (size_t)ch * oh * ow + (size_t)y * ow;
+            uint8_t *dst = img->data + (size_t)y * ow * 4 + ch;
+            for (int x = 0; x < ow; x++) {
+                float val = plane[x] * 127.5f + 127.5f;
+                dst[x * 4] = (uint8_t)(val < 0.0f ? 0.0f : val > 255.0f ? 255.0f : val + 0.5f);
+            }
+        }
+    free(rgba);
+    return img;
+
+fail1:
+    free(merged);
+    free(ds);
+fail0:
+    for (int i = 0; i < n_refs; i++) free(ref_z[i]);
+    free(ref_z);
+    free(grids);
+    free(ref_hw);
+    free(ref_px);
+    return NULL;
 }
 
 static iris_image *iris_generate_flux3_with_embeddings(iris_ctx *ctx,
@@ -1865,6 +2181,10 @@ iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
         set_error("Invalid parameters");
         return NULL;
     }
+    if (ctx->is_qwen21) {
+        const iris_image *refs[1] = { input };
+        return iris_generate_qwen21_edit(ctx, prompt, refs, 1, params);
+    }
     if (ctx->is_zimage) {
         set_error("img2img is not supported for Z-Image");
         return NULL;
@@ -2081,6 +2401,8 @@ iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
     }
     if (ctx->is_flux3 && refs && num_refs > 0)
         return iris_generate_flux3_refs(ctx, prompt, refs, num_refs, params);
+    if (ctx->is_qwen21 && refs && num_refs > 0)
+        return iris_generate_qwen21_edit(ctx, prompt, refs, num_refs, params);
 
     /* No references - text-to-image */
     if (!refs || num_refs == 0) {
