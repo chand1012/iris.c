@@ -1,0 +1,19 @@
+Qwen-Image 2.1 — 40-step editing parity vs official pipeline (256x256)
+=======================================================================
+Run: 2026-10-30, BLAS (CPU Accelerate) build, seed 42,
+prompt "turn the cat into a watercolor painting", 1 reference (/tmp/qw21_cat.png).
+
+Reference dump: /tmp/qw21_edit_ref40 (debug/qwen21_reference.py --editing, 40 steps).
+
+1) Full 40-step chain (debug/qw21_parity_edit.c, cache_mode=0 full passes):
+   step-0 velocity : max_abs=5.149e-04  cos=1.00000
+   final latent    : max_abs=1.513e-04  mean_abs=1.403e-05  0/16384 over 1e-3  cos=1.00000
+   (bf16-level agreement; the reference dump is f32-pytorch)
+
+2) Pixel comparison of C-decoded output (VAE decode of the C final latent,
+   /tmp/qw21_edit_c40_dec.png) vs official image.png:
+   u8 mean=0.20  max=1  frac_over4=0.000%
+   ours mean/std=219.2/42.3   ref mean/std=219.2/42.3
+
+Conclusion: C editing pipeline (vision tower -> joint encode ->
+block-causal DiT -> VAE) matches the official 40-step output pixel-wise.
