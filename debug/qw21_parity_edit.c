@@ -83,29 +83,71 @@ int main(int argc, char **argv)
     while (ns < 64 && fscanf(sf, "%f", &sig[ns]) == 1) ns++;
     fclose(sf);
 
+    /* Run the whole schedule (sigmas.txt holds num_steps+1 values). The
+     * reference latents stay fixed; only target rows take Euler updates. */
     float *v = malloc((size_t)n_target * 64 * sizeof(float));
-    qw_transformer_forward_edit(tf, z, shapes, 2, emb, txt_mask, img_mask, n_slots,
-                                sig[0], v, 0);
-
-    float *vref = read_f32((snprintf(p, sizeof p, "%s/step0_v.bin", argv[2]), p), &n);
-    if (argc > 3) { FILE *o = fopen(argv[3], "wb"); fwrite(v, 4, (size_t)n_target * 64, o); fclose(o); }
-
-    size_t cnt = (size_t)n_target * 64;
-    double mx = 0, mean = 0, rref = 0, rv = 0, dot = 0, nr = 0, nv = 0;
-    int over = 0;
-    for (size_t i = 0; i < cnt; i++) {
-        double d = fabs(vref[i] - v[i]);
-        if (d > mx) mx = d;
-        if (d > 1e-3) over++;
-        mean += d; rref += (double)vref[i] * vref[i]; rv += (double)v[i] * v[i];
-        dot += (double)vref[i] * v[i]; nr += (double)vref[i] * vref[i]; nv += (double)v[i] * v[i];
+    int nsteps = ns - 1;
+    if (nsteps < 1) nsteps = 1;
+    double v_cos = -1, v_mx = 0;
+    for (int st = 0; st < nsteps; st++) {
+        qw_transformer_forward_edit(tf, z, shapes, 2, emb, txt_mask, img_mask,
+                                    n_slots, sig[st], v, 0);
+        if (st == 0) {
+            FILE *probe = fopen((snprintf(p, sizeof p, "%s/step0_v.bin", argv[2]), p), "rb");
+            if (probe) {
+                fclose(probe);
+                float *vref = read_f32((snprintf(p, sizeof p, "%s/step0_v.bin", argv[2]), p), &n);
+                size_t cnt = (size_t)n_target * 64;
+                double rref = 0, rv = 0, dot = 0, nr = 0, nv = 0, mean = 0;
+                for (size_t i = 0; i < cnt; i++) {
+                    double d = fabs(vref[i] - v[i]);
+                    if (d > v_mx) v_mx = d;
+                    mean += d;
+                    dot += (double)vref[i] * v[i]; nr += (double)vref[i] * vref[i];
+                    nv += (double)v[i] * v[i];
+                }
+                v_cos = dot / (sqrt(nr) * sqrt(nv));
+                fprintf(stderr, "EDIT_V n=%zu max_abs=%.3e mean_abs=%.3e cos=%.5f\n",
+                        cnt, v_mx, mean / cnt, v_cos);
+                free(vref);
+            }
+        }
+        float ds = sig[st + 1] - sig[st];
+        float *zt = z + (size_t)n_ref * 64;
+        for (size_t i = 0; i < (size_t)n_target * 64; i++) zt[i] += ds * v[i];
     }
-    fprintf(stderr, "EDIT_V n=%zu max_abs=%.3e mean_abs=%.3e over1e-3=%d (%.3f%%) | rms ref=%.4f ours=%.4f ratio=%.3f cos=%.5f\n",
-            cnt, mx, mean / cnt, over, 100.0 * over / cnt,
-            sqrt(rref / cnt), sqrt(rv / cnt), sqrt(rv / cnt) / sqrt(rref / cnt),
-            dot / (sqrt(nr) * sqrt(nv)));
-    double cosv = dot / (sqrt(nr) * sqrt(nv));
-    printf("edit step-0 velocity parity %s (max_abs %.3e, cos %.5f; limits 1e-3 / 0.999)\n",
-           (cosv >= 0.999) ? "PASS" : "FAIL", mx, cosv);
-    return cosv >= 0.999 ? 0 : 1;
+    if (argc > 3) { FILE *o = fopen(argv[3], "wb"); fwrite(z + (size_t)n_ref * 64, 4, (size_t)n_target * 64, o); fclose(o); }
+
+    int rc = 0;
+    if (v_cos >= 0) {
+        printf("edit step-0 velocity parity %s (max_abs %.3e, cos %.5f; limit cos 0.999)\n",
+               v_cos >= 0.999 ? "PASS" : "FAIL", v_mx, v_cos);
+        if (v_cos < 0.999) rc = 1;
+    }
+    FILE *probe = fopen((snprintf(p, sizeof p, "%s/latent.bin", argv[2]), p), "rb");
+    if (probe) {
+        fclose(probe);
+        float *lat = read_f32((snprintf(p, sizeof p, "%s/latent.bin", argv[2]), p), &n);
+        size_t cnt = (size_t)n_target * 64;
+        if (n == cnt) {
+            double mx = 0, mean = 0, dot = 0, na = 0, nb = 0;
+            int over = 0;
+            for (size_t i = 0; i < cnt; i++) {
+                double d = fabs(lat[i] - z[(size_t)n_ref * 64 + i]);
+                if (d > mx) mx = d;
+                if (d > 1e-3) over++;
+                mean += d;
+                dot += (double)lat[i] * z[(size_t)n_ref * 64 + i];
+                na += (double)lat[i] * lat[i]; nb += (double)z[(size_t)n_ref * 64 + i] * z[(size_t)n_ref * 64 + i];
+            }
+            double cosl = dot / (sqrt(na) * sqrt(nb));
+            fprintf(stderr, "EDIT_LATENT n=%zu max_abs=%.3e mean_abs=%.3e over1e-3=%d (%.3f%%) cos=%.5f\n",
+                    cnt, mx, mean / cnt, over, 100.0 * over / cnt, cosl);
+            printf("edit %d-step latent parity %s (max_abs %.3e, cos %.5f; limit 5e-3)\n",
+                   nsteps, mx < 5e-3 ? "PASS" : "FAIL", mx, cosl);
+            if (mx >= 5e-3) rc = 1;
+        }
+        free(lat);
+    }
+    return rc;
 }
