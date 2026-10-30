@@ -460,10 +460,16 @@ static void qw_rope_apply(float *x, int n_tok, int heads, int hd,
  * case padded (key_valid == 0) keys are excluded.
  * USE_BLAS builds use batched GEMMs for the two matmuls; the mask and
  * softmax are identical in both paths. */
+/* Block-causal attention over a joint sequence: a query at row q_abs may
+ * read key j when j <= q_abs (causal) or when both belong to the same image
+ * block (block_id >= 0), which is what makes each image block internally
+ * bidirectional. block_id == -1 marks text. Invalid keys (right-padded
+ * prompt) are always excluded. */
 static void qw_seg_attn(const float *q, const float *k, const float *v,
                         int heads, int hd, int q_start, int q_end,
-                        int kv_end, int is_text, const int *key_valid,
+                        int kv_end, const int *block_id, const int *key_valid,
                         float *out) {
+    int nblk = block_id ? 1 : 0; (void)nblk;
     int nq = q_end - q_start;
     float *scores = malloc((size_t)nq * kv_end * sizeof(float));
     float scale = 1.0f / sqrtf((float)hd);
@@ -476,10 +482,16 @@ static void qw_seg_attn(const float *q, const float *k, const float *v,
         for (int i = 0; i < nq; i++) {
             float *sr = scores + (size_t)i * kv_end;
             int q_abs = q_start + i;
+            int qb = block_id ? block_id[q_abs] : -1;
+            int same_block_other = 0;
             for (int j = 0; j < kv_end; j++) {
-                if (!key_valid[j] || (is_text && q_abs < j))
-                    sr[j] = -INFINITY;
+                int allowed = (q_abs >= j) ||
+                    (qb >= 0 && block_id[j] == qb);
+                if (!key_valid[j] || !allowed) {
+                    sr[j] = -INFINITY; same_block_other = 1;
+                }
             }
+            (void)same_block_other;
             float mx = -INFINITY;
             for (int j = 0; j < kv_end; j++) if (sr[j] > mx) mx = sr[j];
             if (mx == -INFINITY) { /* all-invalid rows stay zero */
@@ -512,9 +524,11 @@ static void qw_seg_attn(const float *q, const float *k, const float *v,
         for (int i = 0; i < nq; i++) {
             float *sr = scores + (size_t)i * kv_end;
             int q_abs = q_start + i;
+            int qb = block_id ? block_id[q_abs] : -1;
             float mx = -INFINITY;
             for (int j = 0; j < kv_end; j++) {
-                int ok = key_valid[j] && (is_text ? q_abs >= j : 1);
+                int ok = key_valid[j] && ((q_abs >= j) ||
+                                          (qb >= 0 && block_id[j] == qb));
                 if (!ok) { sr[j] = -INFINITY; continue; }
                 if (sr[j] > mx) mx = sr[j];
             }
@@ -558,7 +572,7 @@ static void qw_block(qw_transformer_t *tf, int b, float *x, float *xm,
                      int n_tok, const float *mT, const float *m0,
                      const int *is_target,
                      const float *qk_c, const float *qk_s,  /* per-token RoPE */
-                     int s_txt, int N, const int *key_valid)
+                     const int *block_id, const int *key_valid)
 {
     int dim = tf->dim, heads = tf->heads, hd = tf->head_dim;
     int d4 = 4 * dim;
@@ -592,11 +606,10 @@ static void qw_block(qw_transformer_t *tf, int b, float *x, float *xm,
     qw_rope_apply(k, n_tok, heads, hd, qk_c, qk_s);
 
 
+    /* One block-causal pass over the whole joint sequence: text rows are
+     * strictly causal, every image block is bidirectional inside itself. */
     float *attnout = malloc((size_t)n_tok * dim * sizeof(float));
-    if (s_txt > 0) {
-        qw_seg_attn(q, k, vv, heads, hd, 0, s_txt, s_txt, 1, key_valid, attnout);
-    }
-    qw_seg_attn(q, k, vv, heads, hd, s_txt, N, N, 0, key_valid, attnout);
+    qw_seg_attn(q, k, vv, heads, hd, 0, n_tok, n_tok, block_id, key_valid, attnout);
     free(q); free(k); free(vv);
 
     float *a = malloc((size_t)n_tok * dim * sizeof(float));
@@ -858,7 +871,7 @@ static void qw_attn_host(qw_transformer_t *tf, const uint16_t *dq, const uint16_
         k[i] = qw_bf16_to_f32(dk[i]);
         v[i] = qw_bf16_to_f32(dv[i]);
     }
-    qw_seg_attn(q, k, v, heads, hd, 0, s_txt, s_txt, 1, kv, hout);
+    qw_seg_attn(q, k, v, heads, hd, 0, s_txt, s_txt, NULL, kv, hout);
     /* Reuse the text q slot as bf16 scratch (>= s_txt*dim). */
     uint16_t *b16 = (uint16_t *)q;
     size_t m = 0;
@@ -1148,11 +1161,13 @@ void qw_transformer_forward(qw_transformer_t *tf,
     /* Per-token token classification and RoPE tables. */
     int *is_target = malloc(N * sizeof(int));
     int *key_valid = malloc(N * sizeof(int));
+    int *block_id = malloc(N * sizeof(int));
     float *qk_c = malloc((size_t)N * hd * sizeof(float));
     float *qk_s = malloc((size_t)N * hd * sizeof(float));
     for (int i = 0; i < s_txt; i++) {
         is_target[i] = 0;
         key_valid[i] = txt_mask ? txt_mask[i] : 1;
+        block_id[i] = -1;
         int pos = i; /* all three axes advance with the text cursor */
         qw_token_rope(tf, pos, pos, pos,
                       qk_c + (size_t)i * hd, qk_s + (size_t)i * hd);
@@ -1164,6 +1179,7 @@ void qw_transformer_forward(qw_transformer_t *tf,
             int i = s_txt + r * img_w + c;
             is_target[i] = 1;
             key_valid[i] = 1;
+            block_id[i] = 0;
             /* Frame frozen at the position reached by the preceding text; */
             /* height/width centred on zero.                            */
             qw_token_rope(tf, s_txt, r - hh, c - ww,
@@ -1175,7 +1191,7 @@ void qw_transformer_forward(qw_transformer_t *tf,
     float *xm = malloc((size_t)N * dim * sizeof(float));
     for (int b = 0; b < tf->n_layers; b++) {
         qw_block(tf, b, x, xm, N, modT, mod0, is_target, qk_c, qk_s,
-                 s_txt, N, key_valid);
+                 block_id, key_valid);
     }
     free(xm);
 
@@ -1196,7 +1212,7 @@ void qw_transformer_forward(qw_transformer_t *tf,
     free(out); free(x);
     free(modT); free(mod0); free(tembT); free(temb0);
     free(soutT); free(sout0);
-    free(is_target); free(key_valid); free(qk_c); free(qk_s);
+    free(is_target); free(key_valid); free(block_id); free(qk_c); free(qk_s);
 }
 
 /* ========================================================================
@@ -1224,5 +1240,248 @@ float *iris_sample_euler_qwen21(qw_transformer_t *tf,
         if (progress) progress(i + 1, num_steps);
     }
     free(vel);
+    return z;
+}
+
+
+/* ------------------------------------------------------------------ */
+/* Reference-image (editing) forward.                                   */
+/*                                                                      */
+/* The joint sequence interleaves text with image blocks: each          */
+/* `<image_pad>` slot of the VLM sequence expands to 4 image tokens,    */
+/* and n_target/4 True slots are appended for the target image.         */
+/* Condition-image latents come first (blocks 0..n_cond), the target    */
+/* block last. img_mask is the pipeline's full slot mask (VLM slots and */
+/* the appended target slots); txt rows line up with the mask's         */
+/* non-image positions, in order.                                       */
+/* ------------------------------------------------------------------ */
+static void qw_time_mod_rows(qw_transformer_t *tf, float t,
+                             float *modT, float *mod0,
+                             float *soutT, float *sout0)
+{
+    int dim = tf->dim;
+    float embT[256], emb0[256];
+    qw_time_embed(embT, t);
+    for (int j = 0; j < 128; j++) { emb0[j] = 1.0f; emb0[128 + j] = 0.0f; }
+    float *tembT = malloc(dim * sizeof(float));
+    float *temb0 = malloc(dim * sizeof(float));
+    float *h1 = malloc(dim * sizeof(float));
+    float *ts = malloc(dim * sizeof(float));
+    qw_gemm(embT, tf->time_lin1, h1, 1, 256, dim);
+    qw_silu(h1, dim);
+    qw_gemm(h1, tf->time_lin2, tembT, 1, dim, dim);
+    qw_gemm(emb0, tf->time_lin1, h1, 1, 256, dim);
+    qw_silu(h1, dim);
+    qw_gemm(h1, tf->time_lin2, temb0, 1, dim, dim);
+    memcpy(ts, tembT, dim * sizeof(float)); qw_silu(ts, dim);
+    qw_gemm(ts, tf->modulation, modT, 1, dim, 4 * dim);
+    qw_gemm(ts, tf->norm_out_lin, soutT, 1, dim, dim);
+    memcpy(ts, temb0, dim * sizeof(float)); qw_silu(ts, dim);
+    qw_gemm(ts, tf->modulation, mod0, 1, dim, 4 * dim);
+    qw_gemm(ts, tf->norm_out_lin, sout0, 1, dim, dim);
+    free(tembT); free(temb0); free(h1); free(ts);
+}
+
+/* txt is the encoder output over the VLM sequence after the dropped prefix:
+ * one row per slot of img_mask[0..n_vlm); rows at image slots are never read
+ * (the reference overwrites those positions with the projected latents).
+ * img_mask covers n_vlm slots plus n_target/4 appended target slots. */
+void qw_transformer_forward_edit(qw_transformer_t *tf,
+                                 const float *z,        /* [n_img_tot, in_ch] */
+                                 const int *shapes,     /* [3*n_shapes] (f,h,w) */
+                                 int n_shapes,          /* cond blocks + target */
+                                 const float *txt,      /* [n_vlm, ctx_dim] */
+                                 const int *txt_mask,   /* [n_vlm] or NULL */
+                                 const int *img_mask,   /* [n_slots] */
+                                 int n_slots,
+                                 float sigma, float *v) /* [n_target, in_ch] */
+{
+    int dim = tf->dim, hd = tf->head_dim;
+    int tgt_h = shapes[3 * (n_shapes - 1) + 1];
+    int tgt_w = shapes[3 * (n_shapes - 1) + 2];
+    int n_target = tgt_h * tgt_w;
+    int n_img_tot = 0;
+    for (int s = 0; s < n_shapes; s++)
+        n_img_tot += shapes[3 * s + 1] * shapes[3 * s + 2];
+
+    int n_img_slots = 0;
+    for (int s = 0; s < n_slots; s++) n_img_slots += img_mask[s] ? 1 : 0;
+    if (n_img_slots * 4 != n_img_tot) {
+        fprintf(stderr, "Qwen-Image 2.1: img_mask expands to %d image tokens, "
+                        "expected %d\n", n_img_slots * 4, n_img_tot);
+        return;
+    }
+    int n_txt = n_slots - n_img_slots;
+    int N = n_txt + n_img_tot;
+
+    int *block_id = malloc(N * sizeof(int));
+    int *is_target = malloc(N * sizeof(int));
+    int *key_valid = malloc(N * sizeof(int));
+    float *qk_c = malloc((size_t)N * hd * sizeof(float));
+    float *qk_s = malloc((size_t)N * hd * sizeof(float));
+    float *x = malloc((size_t)N * dim * sizeof(float));
+
+    /* Block start (in joint tokens) of every image block, for the RoPE
+     * cursor walk: blocks appear in the sequence in img_shapes order. */
+    int *blk_start = malloc(n_shapes * sizeof(int));
+    int *blk_len = malloc(n_shapes * sizeof(int));
+    for (int s = 0; s < n_shapes; s++) blk_len[s] = shapes[3 * s + 1] * shapes[3 * s + 2];
+    /* Walk the slots, tracking tokens consumed per block. */
+    {
+        int tok = 0, b = 0, seen = 0;
+        for (int s = 0; s < n_slots; s++) {
+            if (!img_mask[s]) { tok++; continue; }
+            while (b < n_shapes && seen >= blk_len[b]) { b++; seen = 0; }
+            if (seen == 0) blk_start[b] = tok;
+            for (int k = 0; k < 4; k++) {
+                block_id[tok] = b;
+                is_target[tok] = (b == n_shapes - 1);
+                key_valid[tok] = 1;
+                tok++;
+            }
+            seen += 4;
+        }
+        tok = 0;
+        for (int s = 0; s < n_slots; s++) {
+            if (!img_mask[s]) {
+                block_id[tok] = -1; is_target[tok] = 0;
+                key_valid[tok] = txt_mask ? txt_mask[s] : 1;
+                tok++;
+            } else tok += 4;
+        }
+    }
+
+    /* RoPE: text runs advance a shared cursor on all three axes; every image
+     * block freezes the frame axis and lays out a height/width grid. */
+    {
+        int cursor = 0, position = 0;
+        for (int b = 0; b < n_shapes; b++) {
+            int h = shapes[3 * b + 1], w = shapes[3 * b + 2];
+            int text_len = blk_start[b] - cursor;
+            for (int i = 0; i < text_len; i++) {
+                int p = position + i;
+                qw_token_rope(tf, p, p, p, qk_c + (size_t)(cursor + i) * hd,
+                              qk_s + (size_t)(cursor + i) * hd);
+            }
+            position += text_len;
+            int hh = h - h / 2, ww = w - w / 2;
+            for (int r = 0; r < h; r++)
+                for (int c = 0; c < w; c++) {
+                    int tok = blk_start[b] + r * w + c;
+                    qw_token_rope(tf, position, r - hh, c - ww,
+                                  qk_c + (size_t)tok * hd, qk_s + (size_t)tok * hd);
+                }
+            position += (h > w ? h : w);
+            cursor = blk_start[b] + h * w;
+        }
+        for (int i = cursor; i < N; i++) {
+            int p = position + (i - cursor);
+            qw_token_rope(tf, p, p, p, qk_c + (size_t)i * hd,
+                          qk_s + (size_t)i * hd);
+        }
+    }
+
+    /* Joint hidden states: text rows through txt_in, image rows through
+     * img_in, both scattered into slot order. */
+    {
+        float *enc = malloc((size_t)n_txt * tf->ctx_dim * sizeof(float));
+        float *ptx = malloc((size_t)n_txt * dim * sizeof(float));
+        float *pim = malloc((size_t)n_img_tot * dim * sizeof(float));
+        int ti = 0;
+        for (int s = 0; s < n_slots; s++)
+            if (!img_mask[s]) {
+                memcpy(enc + (size_t)ti * tf->ctx_dim,
+                       txt + (size_t)s * tf->ctx_dim,
+                       tf->ctx_dim * sizeof(float));
+                ti++;
+            }
+        float *ph = malloc((size_t)n_txt * dim * sizeof(float));
+        qw_rmsnorm(enc, n_txt, tf->ctx_dim, tf->txt_norm_w, 1, tf->eps);
+        qw_gemm(enc, tf->txt_in, ph, n_txt, tf->ctx_dim, dim);
+        qw_gelu_tanh(ph, n_txt * dim);
+        qw_gemm(ph, tf->txt_out, ptx, n_txt, dim, dim);
+        free(ph);
+        qw_gemm(z, tf->img_in, pim, n_img_tot, tf->in_ch, dim);
+        int jr = 0; ti = 0; int ii = 0;
+        for (int s = 0; s < n_slots; s++) {
+            if (!img_mask[s]) {
+                memcpy(x + (size_t)jr * dim, ptx + (size_t)ti * dim,
+                       dim * sizeof(float));
+                jr++; ti++;
+            } else {
+                for (int k = 0; k < 4; k++) {
+                    memcpy(x + (size_t)jr * dim, pim + (size_t)ii * dim,
+                           dim * sizeof(float));
+                    jr++; ii++;
+                }
+            }
+        }
+        free(enc); free(ptx); free(pim);
+    }
+
+    float *modT = malloc(4 * dim * sizeof(float));
+    float *mod0 = malloc(4 * dim * sizeof(float));
+    float *soutT = malloc(dim * sizeof(float));
+    float *sout0 = malloc(dim * sizeof(float));
+    qw_time_mod_rows(tf, 1000.0f * sigma, modT, mod0, soutT, sout0);
+
+    float *xm = malloc((size_t)N * dim * sizeof(float));
+    for (int b = 0; b < tf->n_layers; b++)
+        qw_block(tf, b, x, xm, N, modT, mod0, is_target, qk_c, qk_s,
+                 block_id, key_valid);
+    free(xm);
+
+    qw_layernorm(x, N, dim, tf->eps);
+    for (int i = 0; i < N; i++) {
+        const float *sc = is_target[i] ? soutT : sout0;
+        float *row = x + (size_t)i * dim;
+        for (int j = 0; j < dim; j++) row[j] *= 1.0f + sc[j];
+    }
+    /* The target block is the last one, so its rows are the tail. */
+    float *out = malloc((size_t)N * tf->in_ch * sizeof(float));
+    qw_gemm(x, tf->proj_out, out, N, dim, tf->in_ch);
+    memcpy(v, out + (size_t)(N - n_target) * tf->in_ch,
+           (size_t)n_target * tf->in_ch * sizeof(float));
+    free(out); free(x);
+    free(modT); free(mod0); free(soutT); free(sout0);
+    free(block_id); free(is_target); free(key_valid);
+    free(qk_c); free(qk_s); free(blk_start); free(blk_len);
+}
+
+float *iris_sample_euler_qwen21_edit(qw_transformer_t *tf,
+                                     float *z, const float *ref_z,
+                                     const int *ref_hw, int n_refs,
+                                     const float *txt, const int *txt_mask,
+                                     int n_txt, const int *img_mask, int n_slots,
+                                     int img_h, int img_w,
+                                     const float *schedule, int num_steps,
+                                     void (*progress)(int step, int total))
+{
+    int n_target = img_h * img_w;
+    int n_cond = 0;
+    for (int i = 0; i < n_refs; i++) n_cond += ref_hw[2 * i] * ref_hw[2 * i + 1];
+    /* shapes: refs then target */
+    int n_shapes = n_refs + 1;
+    int *shapes = malloc(3 * n_shapes * sizeof(int));
+    for (int i = 0; i < n_refs; i++) {
+        shapes[3 * i] = 1; shapes[3 * i + 1] = ref_hw[2 * i];
+        shapes[3 * i + 2] = ref_hw[2 * i + 1];
+    }
+    shapes[3 * n_refs] = 1; shapes[3 * n_refs + 1] = img_h;
+    shapes[3 * n_refs + 2] = img_w;
+
+    float *zin = malloc((size_t)(n_cond + n_target) * tf->in_ch * sizeof(float));
+    float *vel = malloc((size_t)n_target * tf->in_ch * sizeof(float));
+    for (int i = 0; i < num_steps; i++) {
+        memcpy(zin, ref_z, (size_t)n_cond * tf->in_ch * sizeof(float));
+        memcpy(zin + (size_t)n_cond * tf->in_ch, z,
+               (size_t)n_target * tf->in_ch * sizeof(float));
+        qw_transformer_forward_edit(tf, zin, shapes, n_shapes, txt, txt_mask,
+                                    img_mask, n_slots, schedule[i], vel);
+        float dsig = schedule[i + 1] - schedule[i];
+        for (int j = 0; j < n_target * tf->in_ch; j++) z[j] += dsig * vel[j];
+        if (progress) progress(i + 1, num_steps);
+    }
+    free(zin); free(vel); free(shapes);
     return z;
 }
