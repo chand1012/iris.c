@@ -665,31 +665,35 @@ static float *qw_decode_core(iris_vae_qwen_t *v, const float *lat, int lh, int l
  * Tiled paths
  * ---------------------------------------------------------------- */
 
-/* Linear-ramp vertical blend: b's first e rows toward a's bottom rows. */
-static void qw_blend_v(float *a, int ah, int w, float *b, int bh, int c, int e) {
+/* Linear-ramp vertical blend: b's first e rows toward a's bottom rows.
+ * a has row stride a_stride (its tiles may be wider than the shared blend
+ * width w, e.g. the narrow final column tile). */
+static void qw_blend_v(float *a, int ah, int a_stride, int w, float *b, int bh, int c, int e) {
     e = e < ah ? e : ah;
     e = e < bh ? e : bh;
     for (int y = 0; y < e; y++) {
         float wa = 1.0f - y / (float)e;
         float wb = y / (float)e;
         for (int ch = 0; ch < c; ch++) {
-            const float *ra = a + ((size_t)ch * ah + ah - e + y) * w;
+            const float *ra = a + ((size_t)ch * ah + ah - e + y) * a_stride;
             float *rb = b + ((size_t)ch * bh + y) * w;
             for (int x = 0; x < w; x++) rb[x] = ra[x] * wa + rb[x] * wb;
         }
     }
 }
 
-/* Linear-ramp horizontal blend: b's first e cols toward a's right cols. */
-static void qw_blend_h(float *a, int ah, int aw, float *b, int bw, int c, int e) {
-    e = e < aw ? e : aw;
+/* Linear-ramp horizontal blend: b's first e cols toward a's right cols.
+ * a and b share the same tile height (tiles in one grid row are aligned);
+ * a_stride is a's row stride, bw is b's. */
+static void qw_blend_h(float *a, int ah, int a_stride, float *b, int bw, int c, int e) {
+    e = e < a_stride ? e : a_stride;
     e = e < bw ? e : bw;
     for (int x = 0; x < e; x++) {
         float wa = 1.0f - x / (float)e;
         float wb = x / (float)e;
         for (int ch = 0; ch < c; ch++)
             for (int y = 0; y < ah; y++) {
-                const float *ra = a + ((size_t)ch * ah + y) * aw + (aw - e + x);
+                const float *ra = a + ((size_t)ch * ah + y) * a_stride + (a_stride - e + x);
                 float *rb = b + ((size_t)ch * ah + y) * bw + x;
                 *rb = *ra * wa + *rb * wb;
             }
@@ -714,11 +718,13 @@ float *iris_vae_qwen_encode(iris_vae_qwen_t *v, const float *rgba, int H, int W,
         int ncol = (W + QWVAE_TSTRIDE - 1) / QWVAE_TSTRIDE;
         float **prev = calloc(ncol, sizeof(*prev));
         int *prev_lh = calloc(ncol, sizeof(int));
+        int *prev_lw = calloc(ncol, sizeof(int));
         for (int top = 0; top < H; top += QWVAE_TSTRIDE) {
             int th = QWVAE_TILE < H - top ? QWVAE_TILE : H - top;
             int tlh = th / 16;
             float **row = calloc(ncol, sizeof(*row));
             int *row_lh = calloc(ncol, sizeof(int));
+            int *row_lw = calloc(ncol, sizeof(int));
             for (int left = 0; left < W; left += QWVAE_TSTRIDE) {
                 int idx = left / QWVAE_TSTRIDE;
                 int tw = QWVAE_TILE < W - left ? QWVAE_TILE : W - left;
@@ -732,10 +738,10 @@ float *iris_vae_qwen_encode(iris_vae_qwen_t *v, const float *rgba, int H, int W,
                 float *tl = qw_encode_core(v, timg, th, tw);
                 free(timg);
                 if (top > 0 && prev[idx])
-                    qw_blend_v(prev[idx], prev_lh[idx], tlw, tl, tlh, 128,
+                    qw_blend_v(prev[idx], prev_lh[idx], prev_lw[idx], tlw, tl, tlh, 128,
                                QWVAE_LTILE - QWVAE_LSTRIDE);
                 if (left > 0 && row[idx - 1])
-                    qw_blend_h(row[idx - 1], row_lh[idx - 1], tlw, tl, tlw, 128,
+                    qw_blend_h(row[idx - 1], row_lh[idx - 1], row_lw[idx - 1], tl, tlw, 128,
                                QWVAE_LTILE - QWVAE_LSTRIDE);
                 /* keep the leading stride of the (already blended) tile */
                 int keep = QWVAE_LSTRIDE < tlh ? QWVAE_LSTRIDE : tlh;
@@ -747,17 +753,21 @@ float *iris_vae_qwen_encode(iris_vae_qwen_t *v, const float *rgba, int H, int W,
                                (size_t)keepw * sizeof(float));
                 row[idx] = tl;
                 row_lh[idx] = tlh;
+                row_lw[idx] = tlw;
             }
             /* retire the previous row; the current one becomes prev */
             for (int idx = 0; idx < ncol; idx++) free(prev[idx]);
             free(prev);
             free(prev_lh);
+            free(prev_lw);
             prev = row;
             prev_lh = row_lh;
+            prev_lw = row_lw;
         }
         for (int idx = 0; idx < ncol; idx++) free(prev[idx]);
         free(prev);
         free(prev_lh);
+        free(prev_lw);
     }
 
     /* split moments -> mean, normalize */
@@ -784,11 +794,13 @@ float *iris_vae_qwen_decode(iris_vae_qwen_t *v, const float *latents, int lh, in
     int ncol = (lw + QWVAE_LSTRIDE - 1) / QWVAE_LSTRIDE;
     float **prev = calloc(ncol, sizeof(*prev));
     int *prev_sh = calloc(ncol, sizeof(int));
+    int *prev_sw = calloc(ncol, sizeof(int));
     for (int top = 0; top < lh; top += QWVAE_LSTRIDE) {
         int th = QWVAE_LTILE < lh - top ? QWVAE_LTILE : lh - top;
         int tsh = th * 16;
         float **row = calloc(ncol, sizeof(*row));
         int *row_sh = calloc(ncol, sizeof(int));
+        int *row_sw = calloc(ncol, sizeof(int));
         for (int left = 0; left < lw; left += QWVAE_LSTRIDE) {
             int idx = left / QWVAE_LSTRIDE;
             int tw = QWVAE_LTILE < lw - left ? QWVAE_LTILE : lw - left;
@@ -802,10 +814,10 @@ float *iris_vae_qwen_decode(iris_vae_qwen_t *v, const float *latents, int lh, in
             float *ti = qw_decode_core(v, tl, th, tw);
             free(tl);
             if (top > 0 && prev[idx])
-                qw_blend_v(prev[idx], prev_sh[idx], tsw, ti, tsh, 4,
+                qw_blend_v(prev[idx], prev_sh[idx], prev_sw[idx], tsw, ti, tsh, 4,
                            QWVAE_TILE - QWVAE_TSTRIDE);
             if (left > 0 && row[idx - 1])
-                qw_blend_h(row[idx - 1], row_sh[idx - 1], tsw, ti, tsw, 4,
+                qw_blend_h(row[idx - 1], row_sh[idx - 1], row_sw[idx - 1], ti, tsw, 4,
                            QWVAE_TILE - QWVAE_TSTRIDE);
             int keep = QWVAE_TSTRIDE < tsh ? QWVAE_TSTRIDE : tsh;
             int keepw = QWVAE_TSTRIDE < tsw ? QWVAE_TSTRIDE : tsw;
@@ -816,17 +828,21 @@ float *iris_vae_qwen_decode(iris_vae_qwen_t *v, const float *latents, int lh, in
                            (size_t)keepw * sizeof(float));
             row[idx] = ti;
             row_sh[idx] = tsh;
+            row_sw[idx] = tsw;
         }
         /* retire the previous row; the current one becomes prev */
         for (int idx = 0; idx < ncol; idx++) free(prev[idx]);
         free(prev);
         free(prev_sh);
+        free(prev_sw);
         prev = row;
         prev_sh = row_sh;
+        prev_sw = row_sw;
     }
     for (int idx = 0; idx < ncol; idx++) free(prev[idx]);
     free(prev);
     free(prev_sh);
+    free(prev_sw);
     qw_clamp(img, (size_t)4 * H * W);
     return img;
 }
