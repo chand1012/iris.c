@@ -29,3 +29,7 @@ documents/
 *.so
 *.dylib
 qwen-image-*/
+
+# Generated shader source + binary
+iris
+iris_shaders_source.h
