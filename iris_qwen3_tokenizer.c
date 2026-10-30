@@ -1149,6 +1149,59 @@ int *qwen3_tokenize_chat_with_system(qwen3_tokenizer_t *tok, const char *prompt,
     return tokens;
 }
 
+/* Qwen-Image 2.1 editing template: system message, then a user turn with
+ * per-image "<imageN><|vision_start|>(image_pad x counts[i])<|vision_end|>",
+ * then the prompt. Special vision tokens are inserted by id because the raw
+ * BPE path does not match added tokens inside the text. */
+int *qwen3_tokenize_chat_with_images(qwen3_tokenizer_t *tok, const char *prompt,
+                                     const char *system_prompt,
+                                     const int *pad_counts, int n_img,
+                                     int *num_tokens, int max_len) {
+    if (max_len <= 0) max_len = QWEN3_MAX_SEQ_LEN;
+
+    int vs = vocab_hash_lookup(tok->vocab_hash, tok->hash_size, "<|vision_start|>");
+    int ve = vocab_hash_lookup(tok->vocab_hash, tok->hash_size, "<|vision_end|>");
+    int pad = vocab_hash_lookup(tok->vocab_hash, tok->hash_size, "<|image_pad|>");
+    if (vs < 0 || ve < 0 || pad < 0) return NULL;
+
+    int capacity = 512;
+    int *tokens = malloc(capacity * sizeof(int));
+    int total = 0;
+
+    if (total < max_len) tokens[total++] = QWEN3_IM_START_ID;
+    append_tokenized(tok, "system\n", &tokens, &total, &capacity, max_len);
+    append_tokenized(tok, system_prompt, &tokens, &total, &capacity, max_len);
+    if (total < max_len) tokens[total++] = QWEN3_IM_END_ID;
+    append_tokenized(tok, "\n", &tokens, &total, &capacity, max_len);
+
+    if (total < max_len) tokens[total++] = QWEN3_IM_START_ID;
+    append_tokenized(tok, "user\n", &tokens, &total, &capacity, max_len);
+    for (int i = 0; i < n_img; i++) {
+        char tag[32];
+        if (i) append_tokenized(tok, " ", &tokens, &total, &capacity, max_len);
+        snprintf(tag, sizeof tag, "<image%d>", i + 1);
+        append_tokenized(tok, tag, &tokens, &total, &capacity, max_len);
+        if (total < max_len) tokens[total++] = vs;
+        for (int k = 0; k < pad_counts[i] && total < max_len; k++) {
+            if (total >= capacity) {
+                capacity *= 2;
+                tokens = realloc(tokens, capacity * sizeof(int));
+                if (!tokens) { *num_tokens = 0; return NULL; }
+            }
+            tokens[total++] = pad;
+        }
+        if (total < max_len) tokens[total++] = ve;
+    }
+    append_tokenized(tok, prompt, &tokens, &total, &capacity, max_len);
+    if (total < max_len) tokens[total++] = QWEN3_IM_END_ID;
+    append_tokenized(tok, "\n", &tokens, &total, &capacity, max_len);
+    if (total < max_len) tokens[total++] = QWEN3_IM_START_ID;
+    append_tokenized(tok, "assistant\n", &tokens, &total, &capacity, max_len);
+
+    *num_tokens = total;
+    return tokens;
+}
+
 /*
  * Pad token sequence to max_len with PAD tokens.
  * Returns new array, caller must free original.

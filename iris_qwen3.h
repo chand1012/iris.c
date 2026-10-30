@@ -73,11 +73,24 @@ int *qwen3_tokenize_chat_with_system(qwen3_tokenizer_t *tok, const char *prompt,
                                      const char *system_prompt,
                                      int *num_tokens, int max_len);
 
+/* Qwen-Image 2.1 editing template (vision blocks with expanded image_pad). */
+int *qwen3_tokenize_chat_with_images(qwen3_tokenizer_t *tok, const char *prompt,
+                                     const char *system_prompt,
+                                     const int *pad_counts, int n_img,
+                                     int *num_tokens, int max_len);
+
 /*
  * Pad tokens to max_len with PAD token.
  * Returns new array, caller must free original.
  */
 int *qwen3_pad_tokens(int *tokens, int num_tokens, int max_len, int *attention_mask);
+
+/*
+ * Raw tokenizer entry (handles special tokens in the text). Used by the
+ * Qwen-Image 2.1 editing template.
+ */
+int *qwen3_tokenize(qwen3_tokenizer_t *tok, const char *text,
+                    int *num_tokens, int max_len);
 
 /*
  * Get token string by ID.
@@ -171,6 +184,26 @@ float *qwen3_encode_text(qwen3_encoder_t *enc, const char *prompt);
  */
 float *qwen3_encode_text_ex(qwen3_encoder_t *enc, const char *prompt,
                               int *out_num_tokens, int *out_seq_len);
+
+/*
+ * Qwen-Image 2.1 image-editing encoding: prompt plus condition images.
+ * grids[i] = (t, h, w) post-patchify grid of image i (h/2 * w/2 merged
+ * tokens). vision_merged = [sum(h/2*w/2), hidden] merged vision embeddings
+ * in token order; vision_deepstack = optional [3][rows][hidden] deepstack
+ * features (added after LM layers 0..2). Returns embeddings for all valid
+ * tokens after dropping the system prefix (rows are NOT capped at 512 in
+ * this mode); out_img_mask (optional) receives a caller-freed malloc'd
+ * array of out_seq_len ints marking the image slots. Caller must free the
+ * returned embedding array.
+ */
+typedef struct { int t, h, w; } qwen3_image_grid_t;
+
+float *qwen3_encode_images_ex(qwen3_encoder_t *enc, const char *prompt,
+                              int n_img, const qwen3_image_grid_t *grids,
+                              const float *vision_merged,
+                              const float *vision_deepstack,
+                              int *out_num_tokens, int *out_seq_len,
+                              int **out_img_mask);
 
 #ifdef __cplusplus
 }

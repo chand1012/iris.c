@@ -119,6 +119,7 @@ struct qwen3_model {
     /* RoPE tables, filled for each forward pass */
     float *rope_cos;          /* [max_seq_len, head_dim/2] */
     float *rope_sin;          /* [max_seq_len, head_dim/2] */
+    int mrope_hw;             /* interleaved-mrope H/W boundary (3*max(section)); 0 = unset */
 
     /* Working memory */
     float *hidden_state;      /* [seq_len, hidden] */
@@ -281,13 +282,19 @@ static void qwen3_softmax(float *x, int len) {
  * what the transformers version Flux3 was trained with assigns them, and
  * the Flux3 transformer attends to the padding embeddings. */
 static void qwen3_set_rope_positions(qwen3_model_t *model,
-                                     const int *attention_mask, int seq_len) {
+                                     const int *attention_mask, int seq_len,
+                                     const int *posT, const int *posH, const int *posW) {
     int half_dim = model->head_dim / 2;
     int pad_at_one = model->extraction_mode == QWEN3_EXTRACT_FLUX3 && attention_mask;
+    int hw = model->mrope_hw;
 
     for (int s = 0; s < seq_len; s++) {
         int pos = (pad_at_one && !attention_mask[s]) ? 1 : s;
         for (int i = 0; i < half_dim; i++) {
+            if (posT) {
+                int axis = (hw && i < hw) ? i % 3 : 0;
+                pos = axis == 1 ? posH[s] : axis == 2 ? posW[s] : posT[s];
+            }
             float freq = 1.0f / powf(model->rope_theta, (float)(2 * i) / model->head_dim);
             float angle = pos * freq;
             model->rope_cos[s * half_dim + i] = cosf(angle);
@@ -1110,8 +1117,28 @@ static int qwen3_forward_gpu(qwen3_model_t *model, int seq_len, const int *atten
  * -> [seq, n*hidden]. Stops early at the last needed extraction layer to
  * skip unnecessary layers of compute. Tries fully GPU-resident path first,
  * falls back to mixed CPU/GPU or pure CPU. */
+static float *qwen3_forward_mi(qwen3_model_t *model, const int *input_ids,
+                               const int *attention_mask, int seq_len,
+                               const int *posT, const int *posH, const int *posW,
+                               const int *img_rows, int n_rows,
+                               const float *merged, const float *ds);
+
 float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
                      const int *attention_mask, int seq_len) {
+    return qwen3_forward_mi(model, input_ids, attention_mask, seq_len,
+                            NULL, NULL, NULL, NULL, 0, NULL, NULL);
+}
+
+/* Internal forward with Qwen3-VL image conditioning:
+ * posT/posH/posW: per-token interleaved-mrope positions (else 1D by index);
+ * img_rows: token indices of the image_pad slots (ascending); merged:
+ * [n_rows, hidden] vision embeddings replacing those slots' token embeds;
+ * ds: [3][n_rows, hidden] deepstack features added after layers 0..2. */
+static float *qwen3_forward_mi(qwen3_model_t *model, const int *input_ids,
+                               const int *attention_mask, int seq_len,
+                               const int *posT, const int *posH, const int *posW,
+                               const int *img_rows, int n_rows,
+                               const float *merged, const float *ds) {
     int hidden = model->hidden_size;
     int out_layers[QWEN3_MAX_OUTPUT_LAYERS];
     int num_out = qwen3_output_layers(model, out_layers);
@@ -1119,7 +1146,7 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
     float *output;
 
     if (seq_len > model->max_seq_len) return NULL;
-    qwen3_set_rope_positions(model, attention_mask, seq_len);
+    qwen3_set_rope_positions(model, attention_mask, seq_len, posT, posH, posW);
 
     /* Embedding lookup */
     for (int s = 0; s < seq_len; s++) {
@@ -1133,17 +1160,21 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
             memset(model->hidden_state + s * hidden, 0, hidden * sizeof(float));
         }
     }
+    /* Vision embeddings replace the image_pad slot embeddings */
+    for (int k = 0; k < n_rows; k++)
+        memcpy(model->hidden_state + (size_t)img_rows[k] * hidden,
+               merged + (size_t)k * hidden, hidden * sizeof(float));
 
     /* Run through transformer layers */
 #ifdef QWEN3_DEV
     /* CUDA / ROCm: whole forward pass on the GPU, weights from the mmap */
-    if (iris_dev_available() && model->use_mmap &&
+    if (iris_dev_available() && model->use_mmap && !img_rows &&
         qwen3_forward_dev(model, seq_len, attention_mask, out_layers, num_out))
         goto concatenate;
 #endif
 #ifdef USE_METAL
     /* Try fully GPU-resident path: 1 sync instead of 72, skips unneeded layers */
-    if (model->use_bf16 && iris_metal_available() && seq_len <= 512) {
+    if (model->use_bf16 && iris_metal_available() && seq_len <= 512 && !img_rows) {
         if (qwen3_forward_gpu(model, seq_len, attention_mask))
             goto concatenate;
         /* GPU path failed, fall through to mixed CPU/GPU path.
@@ -1199,6 +1230,16 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
         for (int i = 0; i < num_out; i++)
             if (layer_idx == out_layers[i])
                 memcpy(model->layer_outputs[i], model->hidden_state, seq_len * hidden * sizeof(float));
+
+        /* DeepStack: add vision features to the image slots after layers 0..2 */
+        if (ds && layer_idx < 3) {
+            const float *dl = ds + (size_t)layer_idx * n_rows * hidden;
+            for (int k = 0; k < n_rows; k++) {
+                float *row = model->hidden_state + (size_t)img_rows[k] * hidden;
+                const float *add = dl + (size_t)k * hidden;
+                for (int j = 0; j < hidden; j++) row[j] += add[j];
+            }
+        }
 
         /* Progress callback */
         if (iris_text_progress_callback)
@@ -1674,6 +1715,14 @@ static int parse_qwen3_config(const char *model_dir, qwen3_model_t *model) {
     if ((p = strstr(base, "\"rope_theta\""))) {
         if ((p = strchr(p, ':'))) rope_theta = atof(p + 1);
     }
+    /* Qwen3-VL interleaved mrope: freq slot i takes the T/H/W position with
+     * axis i%3 for i < 3*max(section[H], section[W]); the rest stay T. */
+    int mrope_hw = 0;
+    if ((p = strstr(base, "\"mrope_section\"")) && (p = strchr(p, '['))) {
+        int ms[3] = {0, 0, 0};
+        if (sscanf(p + 1, " %d , %d , %d", &ms[0], &ms[1], &ms[2]) == 3)
+            mrope_hw = 3 * (ms[1] > ms[2] ? ms[1] : ms[2]);
+    }
 
     if (hidden <= 0 || num_heads <= 0) return -1;
 
@@ -1685,6 +1734,7 @@ static int parse_qwen3_config(const char *model_dir, qwen3_model_t *model) {
     model->vocab_size = vocab_size > 0 ? vocab_size : QWEN3_VOCAB_SIZE;
     model->num_layers = num_layers > 0 ? num_layers : 36;
     model->rope_theta = rope_theta > 0 ? rope_theta : QWEN3_ROPE_THETA;
+    model->mrope_hw = mrope_hw;
 
     return 0;
 }
@@ -2173,6 +2223,106 @@ float *qwen3_encode_text_ex(qwen3_encoder_t *enc, const char *prompt,
     free(attention_mask);
 
     return embeddings;
+}
+
+/* Editing (ti2i) encoding for Qwen-Image 2.1: builds the chat template with
+ * per-image vision blocks ("<imageN><|vision_start|>(pad x G)<|vision_end|>"),
+ * injects precomputed vision embeddings (merged rows + 3 deepstack sets,
+ * rows in merged-token raster order matching the pad slots), and returns
+ * embeddings for all valid tokens after the system-prefix drop (no 512 cap
+ * in this mode). out_img_mask (optional) receives a malloc'd array of
+ * out_seq_len ints marking image slots (caller frees). */
+float *qwen3_encode_images_ex(qwen3_encoder_t *enc, const char *prompt,
+                              int n_img, const qwen3_image_grid_t *grids,
+                              const float *vision_merged,
+                              const float *vision_deepstack,
+                              int *out_num_tokens, int *out_seq_len,
+                              int **out_img_mask) {
+    if (!enc || !enc->tokenizer || !enc->model || !prompt || n_img <= 0 ||
+        !grids || !vision_merged) return NULL;
+    if (enc->model->extraction_mode != QWEN3_EXTRACT_QWEN21) return NULL;
+
+    int pad_id = qwen3_get_id(enc->tokenizer, "<|image_pad|>");
+    if (pad_id < 0) return NULL;
+
+    int total_rows = 0;
+    int *pad_counts = malloc(n_img * sizeof(int));
+    if (!pad_counts) return NULL;
+    for (int i = 0; i < n_img; i++) {
+        pad_counts[i] = grids[i].t * (grids[i].h / 2) * (grids[i].w / 2);
+        total_rows += pad_counts[i];
+    }
+
+    int ntok;
+    int *tokens = qwen3_tokenize_chat_with_images(enc->tokenizer, prompt,
+                                  QWEN3_QWEN21_SYSTEM_PROMPT, pad_counts,
+                                  n_img, &ntok, enc->model->max_seq_len);
+    free(pad_counts);
+    if (!tokens) return NULL;
+
+    /* Interleaved-mrope positions: text runs advance all three axes; each
+     * image run lays its merged grid (frame, row, col) at the current
+     * position, then advances it by max(H, W) / merge. */
+    int *posT = malloc(ntok * sizeof(int));
+    int *posH = malloc(ntok * sizeof(int));
+    int *posW = malloc(ntok * sizeof(int));
+    int *attn = malloc(ntok * sizeof(int));
+    int *img_rows = malloc((total_rows + 1) * sizeof(int));
+    if (!posT || !posH || !posW || !attn || !img_rows) {
+        free(tokens); free(posT); free(posH); free(posW); free(attn); free(img_rows);
+        return NULL;
+    }
+    int cur = 0, nrow = 0, gi = 0;
+    for (int s = 0; s < ntok; ) {
+        if (tokens[s] == pad_id) {
+            int run = 0;
+            while (s + run < ntok && tokens[s + run] == pad_id) run++;
+            const qwen3_image_grid_t *g = &grids[gi < n_img ? gi : n_img - 1];
+            gi++;
+            int llh = g->h / 2, llw = g->w / 2, per = llh * llw;
+            for (int r = 0; r < run; r++) {
+                int fr = r / per, rem = r % per;
+                posT[s + r] = cur + fr;
+                posH[s + r] = cur + rem / llw;
+                posW[s + r] = cur + rem % llw;
+                img_rows[nrow++] = s + r;
+            }
+            cur += (g->h > g->w ? g->h : g->w) / 2;
+            s += run;
+        } else {
+            posT[s] = posH[s] = posW[s] = cur++;
+            s++;
+        }
+    }
+    for (int s = 0; s < ntok; s++) attn[s] = 1;
+
+    float *embeddings = qwen3_forward_mi(enc->model, tokens, attn, ntok,
+                                         posT, posH, posW,
+                                         img_rows, nrow, vision_merged,
+                                         vision_deepstack);
+    free(tokens); free(posT); free(posH); free(posW); free(attn);
+
+    int len = ntok - QWEN3_QWEN21_DROP_IDX;
+    if (!embeddings || len <= 0) { free(img_rows); return NULL; }
+    int hidden = enc->model->hidden_size;
+    float *out = malloc((size_t)len * hidden * sizeof(float));
+    memcpy(out, embeddings + (size_t)QWEN3_QWEN21_DROP_IDX * hidden,
+           (size_t)len * hidden * sizeof(float));
+    free(embeddings);
+    if (out_img_mask) {
+        int *m = malloc((size_t)len * sizeof(int));
+        if (!m) { free(out); free(img_rows); return NULL; }
+        for (int r = 0; r < len; r++) m[r] = 0;
+        for (int k = 0; k < nrow; k++) {
+            int row = img_rows[k] - QWEN3_QWEN21_DROP_IDX;
+            if (row >= 0 && row < len) m[row] = 1;
+        }
+        *out_img_mask = m;
+    }
+    free(img_rows);
+    if (out_num_tokens) *out_num_tokens = len;
+    if (out_seq_len) *out_seq_len = len;
+    return out;
 }
 
 float *qwen3_encode_text(qwen3_encoder_t *enc, const char *prompt) {
